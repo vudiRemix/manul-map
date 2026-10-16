@@ -1,0 +1,45 @@
+package cn.net.rms.confluxmap.bridge;
+
+import cn.net.rms.confluxmap.core.task.SessionGuard;
+import java.util.Optional;
+
+/**
+ * The only doorway from version-agnostic code to the running game.
+ * Implemented once per Minecraft version in the {@code mc} package;
+ * {@code core} and UI logic depend on this interface alone.
+ */
+public interface GameBridge {
+    /** The current world session (world identity + dimension + token). */
+    SessionGuard.Session session();
+
+    /**
+     * Player pose, empty while no world is loaded. {@code tickDelta} interpolates
+     * position and yaw between ticks for smooth per-frame rendering.
+     */
+    Optional<PlayerView> player(float tickDelta);
+
+    default Optional<PlayerView> player() {
+        return player(1.0F);
+    }
+
+    /**
+     * Active client viewpoint, which may belong to a detached camera entity. Implementations
+     * fall back to {@link #player(float)} while no separate camera entity is available.
+     */
+    default Optional<PlayerView> viewpoint(final float tickDelta) {
+        return player(tickDelta);
+    }
+
+    default Optional<PlayerView> viewpoint() {
+        return viewpoint(1.0F);
+    }
+
+    /** Whether the active viewpoint belongs to an entity other than the local player. */
+    boolean isCameraDetached();
+
+    /** Whether the calling thread is the render thread (the client main thread). */
+    boolean isOnRenderThread();
+
+    /** Run a task on the render thread (next frame at the latest). */
+    void runOnRenderThread(Runnable task);
+}

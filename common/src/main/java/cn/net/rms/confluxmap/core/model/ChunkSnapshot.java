@@ -1,0 +1,118 @@
+package cn.net.rms.confluxmap.core.model;
+
+/**
+ * Immutable per-column map data for one 16x16 chunk, produced on the main
+ * thread and consumed by worker threads. Arrays are indexed {@code z * 16 + x}
+ * and must never be mutated after construction.
+ */
+public final class ChunkSnapshot {
+    public static final int COLUMNS = 256;
+    /** Marker in {@link #surfaceY} for columns without a surface: never-received and captured void columns. */
+    public static final short NO_SURFACE = Short.MIN_VALUE;
+
+    public final int chunkX;
+    public final int chunkZ;
+    public final long sessionToken;
+    /** Comparable Minecraft world revision; {@link Long#MIN_VALUE} means legacy/unknown. */
+    public final long sourceRevision;
+    public final short[] surfaceY;
+    /** Stable registry identifier per captured column, for example {@code minecraft:plains}. */
+    public final String[] biomeId;
+    public final byte[] fluidDepth;
+    public final int[] baseArgb;
+    /** Raw texture-average colors retained for Xaero rendering; tint is still stored separately. */
+    public final int[] xaeroBaseArgb;
+    public final int[] tintArgb;
+    /** Overlay color with its own tint already applied, 0 = no overlay. See surface-color-sampling.md §1/§5. */
+    public final int[] overlayArgb;
+    /** Xaero-filtered overlay/floor colors; decorative blocks that Xaero hides remain transparent. */
+    public final int[] xaeroOverlayArgb;
+    public final byte[] kind;
+    /**
+     * Block-light level (0-15) at the air block above the sampled surface position. Captured
+     * for every layer (cheap, one extra light query per column). SURFACE consumes it for dynamic
+     * day/night shading ({@code core.color.ShadingPipeline#applyDaylight}); NETHER_CEILING uses it
+     * to replace the ambient tint during tile composition so authoritative and synchronized roof
+     * pixels share the same light path. Other CAVE/NETHER/END layers bake light into
+     * {@link #baseArgb} at snapshot time.
+     */
+    public final byte[] light;
+
+    public ChunkSnapshot(
+        final int chunkX,
+        final int chunkZ,
+        final long sessionToken,
+        final long sourceRevision,
+        final short[] surfaceY,
+        final String[] biomeId,
+        final byte[] fluidDepth,
+        final int[] baseArgb,
+        final int[] xaeroBaseArgb,
+        final int[] tintArgb,
+        final int[] overlayArgb,
+        final int[] xaeroOverlayArgb,
+        final byte[] kind,
+        final byte[] light
+    ) {
+        if (surfaceY.length != COLUMNS || biomeId.length != COLUMNS || fluidDepth.length != COLUMNS
+            || baseArgb.length != COLUMNS || xaeroBaseArgb.length != COLUMNS
+            || tintArgb.length != COLUMNS
+            || overlayArgb.length != COLUMNS || xaeroOverlayArgb.length != COLUMNS
+            || kind.length != COLUMNS || light.length != COLUMNS) {
+            throw new IllegalArgumentException("snapshot arrays must have 256 entries");
+        }
+        this.chunkX = chunkX;
+        this.chunkZ = chunkZ;
+        this.sessionToken = sessionToken;
+        this.sourceRevision = sourceRevision;
+        this.surfaceY = surfaceY;
+        this.biomeId = biomeId;
+        this.fluidDepth = fluidDepth;
+        this.baseArgb = baseArgb;
+        this.xaeroBaseArgb = xaeroBaseArgb;
+        this.tintArgb = tintArgb;
+        this.overlayArgb = overlayArgb;
+        this.xaeroOverlayArgb = xaeroOverlayArgb;
+        this.kind = kind;
+        this.light = light;
+    }
+
+    public ChunkSnapshot(
+        final int chunkX,
+        final int chunkZ,
+        final long sessionToken,
+        final long sourceRevision,
+        final short[] surfaceY,
+        final String[] biomeId,
+        final byte[] fluidDepth,
+        final int[] baseArgb,
+        final int[] tintArgb,
+        final int[] overlayArgb,
+        final byte[] kind,
+        final byte[] light
+    ) {
+        this(
+            chunkX, chunkZ, sessionToken, sourceRevision, surfaceY, biomeId, fluidDepth,
+            baseArgb, baseArgb, tintArgb, overlayArgb, overlayArgb, kind, light
+        );
+    }
+
+    public ChunkSnapshot(
+        final int chunkX,
+        final int chunkZ,
+        final long sessionToken,
+        final short[] surfaceY,
+        final String[] biomeId,
+        final byte[] fluidDepth,
+        final int[] baseArgb,
+        final int[] tintArgb,
+        final int[] overlayArgb,
+        final byte[] kind,
+        final byte[] light
+    ) {
+        this(
+            chunkX, chunkZ, sessionToken, Long.MIN_VALUE, surfaceY, biomeId, fluidDepth,
+            baseArgb, baseArgb, tintArgb, overlayArgb, overlayArgb, kind, light
+        );
+    }
+}

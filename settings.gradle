@@ -1,0 +1,69 @@
+pluginManagement {
+    repositories {
+        maven {
+            name = 'Fabric'
+            url = 'https://maven.fabricmc.net/'
+        }
+        maven {
+            name = 'Jitpack'
+            url = 'https://jitpack.io'
+        }
+        mavenCentral()
+        gradlePluginPortal()
+    }
+    resolutionStrategy {
+        eachPlugin {
+            switch (requested.id.id) {
+                // Served from the Conflux-Union fork of ReplayMod/preprocessor rather than
+                // com.github.ReplayMod directly: the upstream jitpack build is outside our
+                // control, while our tag v1.0.0 pins upstream commit 221276c7d4 (plus a remap
+                // coordinate rewrite onto our own fork) and can be rebuilt at will. Do not
+                // switch back to a Fallen-Breath-flavored build: its createNode maps parameter
+                // is typed non-null, which rejects the null namespace an unobfuscated version
+                // node needs.
+                case 'com.replaymod.preprocess': {
+                    useModule "com.github.Conflux-Union:preprocessor:$requested.version"
+                    break
+                }
+                // 26.1 is unobfuscated: fabric-loom applies to it without remapping, while every
+                // obfuscated version keeps the remapping variant. Both ids resolve to one artifact.
+                case 'net.fabricmc.fabric-loom':
+                case 'net.fabricmc.fabric-loom-remap': {
+                    useModule "net.fabricmc:fabric-loom:${requested.version}"
+                    break
+                }
+            }
+        }
+    }
+}
+// 26.1 targets Java 25 while every earlier version builds on the JDK already in PATH. This lets
+// Gradle provision the missing toolchain itself instead of requiring a manual JDK 25 install.
+plugins {
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '1.0.0'
+}
+include ':api'
+// JitPack builds the zero-dependency api module straight from a git tag. Assembling the
+// full graph would configure loom and download Minecraft inside its build window, so the
+// multi-project layout comes together only outside JitPack.
+if (System.getenv('JITPACK')) {
+    return
+}
+include ':common'
+include ':paper'
+// Manulcraft: -PconfluxMaxVersion=1.21.4 leaves newer versions (and their JDK 25 toolchain) out
+// of the graph; the preprocessor chain up to that version stays intact.
+final String confluxMaxVersion = startParameter.projectProperties.get('confluxMaxVersion')
+final Closure<Integer> versionKey = { final String v ->
+    final List<String> parts = v.tokenize('.')
+    (parts[0] + parts[1].padLeft(2, '0') + (parts.size() > 2 ? parts[2] : '0').padLeft(2, '0')).toInteger()
+}
+file('versions').eachDir { final File dir ->
+    if (confluxMaxVersion != null && versionKey(dir.name) > versionKey(confluxMaxVersion)) {
+        return
+    }
+    final String version = ":$dir.name"
+    include version
+    final ProjectDescriptor projectDescriptor = project version
+    projectDescriptor.projectDir = dir
+    projectDescriptor.buildFileName = '../../common.gradle'
+}

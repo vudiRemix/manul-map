@@ -1,0 +1,66 @@
+package cn.net.rms.confluxmap.core.net;
+
+import java.util.List;
+
+/**
+ * {@code 0x04 S2C MAP_PATCH}: one tile's worth of server-side correction data.
+ *
+ * <p>The fixed header, presence bitmap, structure entries, and compressed residual body are all
+ * parsed by {@link MsgCodec}; {@link PatchCodec} owns the body layout and bounded decompression.
+ *
+ * @param reqId         echo of {@link MapViewReqC2S#reqId()}
+ * @param dimIndex      echo of {@link MapViewReqC2S#dimIndex()}
+ * @param lod           echo of {@link MapViewReqC2S#lod()}
+ * @param tileX         tile X this patch belongs to
+ * @param tileZ         tile Z this patch belongs to
+ * @param mode          one of {@link Proto#PATCH_MODE_UNCHANGED} / {@link Proto#PATCH_MODE_RESIDUAL} /
+ *                      {@link Proto#PATCH_MODE_ABSOLUTE} / {@link Proto#PATCH_MODE_UNAVAILABLE} /
+ *                      {@link Proto#PATCH_MODE_PARTIAL}
+ * @param tileRevision  opaque fingerprint of the authoritative tile snapshot; the client echoes it
+ *                      back as {@link MapViewReqC2S.TileReq#sinceRevision()} on the next request
+ * @param presence      exactly {@value Proto#PATCH_PRESENCE_BYTES} bytes; one coarse diagnostic bit
+ *                      per 16x16 output-pixel cell. Exact evaluated coverage lives in the body.
+ * @param body          PatchCodec-compressed field-plane payload; its interpretation depends on {@code mode}:
+ *                      <ul>
+ *                        <li>{@link Proto#PATCH_MODE_UNCHANGED} / {@link Proto#PATCH_MODE_UNAVAILABLE}:
+ *                            always empty.</li>
+ *                        <li>{@link Proto#PATCH_MODE_ABSOLUTE} / {@link Proto#PATCH_MODE_RESIDUAL} /
+ *                            {@link Proto#PATCH_MODE_PARTIAL}:
+ *                            PatchCodec-encoded records.</li>
+ *                      </ul>
+ */
+public record MapPatchS2C(
+    int reqId,
+    int dimIndex,
+    int lod,
+    int tileX,
+    int tileZ,
+    int mode,
+    long tileRevision,
+    byte[] presence,
+    byte[] body,
+    List<StructureEntry> structures
+) implements Message {
+    public record StructureEntry(int structType, int blockX, int blockZ, int state) {
+    }
+
+    public MapPatchS2C(
+        final int reqId, final int dimIndex, final int lod, final int tileX, final int tileZ, final int mode,
+        final long tileRevision, final byte[] presence, final byte[] body
+    ) {
+        this(reqId, dimIndex, lod, tileX, tileZ, mode, tileRevision, presence, body, List.of());
+    }
+
+    public MapPatchS2C {
+        presence = presence == null ? null : presence.clone();
+        body = body == null ? null : body.clone();
+        structures = structures == null ? List.of() : List.copyOf(structures);
+        if (structures.size() > 255) {
+            throw new IllegalArgumentException("too many structure entries");
+        }
+    }
+    @Override
+    public int typeId() {
+        return Proto.MSG_MAP_PATCH_S2C;
+    }
+}

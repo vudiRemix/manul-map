@@ -1,0 +1,434 @@
+package cn.net.rms.confluxmap.core.predict;
+
+import cn.net.rms.confluxmap.core.model.SurfaceKind;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+/**
+ * Stylizes tree canopy in place onto an already-{@link BaselineDeriver#derive derived} grid. The
+ * production predicted-map path uses the deterministic seed-hashed overview on every Minecraft
+ * version, keeping canopy cost tied to the 256x256 output rather than the number of world chunks a
+ * tile covers. The native-candidate overload remains available for focused feature evaluation but
+ * is not part of the wire baseline.
+ *
+ * <p>The deterministic fallback has two regimes, both driven by a splitmix64-mixed hash of
+ * {@code (seed, blockX, blockZ)}:
+ * <ul>
+ *   <li>LOD 0-1: jittered blob anchors clump sparse canopy into small crowns. Dense biomes invert
+ *       the same field into irregular clearings, allowing jungle canopy to approach full cover
+ *       without exposing the anchor grid.
+ *   <li>LOD &ge; 2: a direct per-pixel Bernoulli test - at 4+ blocks/pixel individual trees
+ *       aren't distinguishable anyway, so per-pixel noise reads as an aggregate canopy texture.
+ * </ul>
+ *
+ * <p>Runs over the whole margin-inclusive grid (not just the rendered 256x256), so both diagonal
+ * slope samples at tile edges see the same stylization ordinary pixels would.
+ */
+public final class CanopyStylizer {
+    private static final int MAX_NATURAL_LOD = 1;
+    private static final int MAX_CANDIDATES_PER_CHUNK = 256;
+    // cubiomes terrain_features.h enum NaturalTreeType ordinals.
+    private static final int TREE_JUNGLE = 3;
+    private static final int TREE_DARK_OAK = 5;
+    private static final int TREE_JUNGLE_BUSH = 6;
+    private static final int TREE_HUGE_BROWN_MUSHROOM = 7;
+    private static final int TREE_HUGE_RED_MUSHROOM = 8;
+    private static final int TREE_MANGROVE = 9;
+    private static final int TREE_CHERRY = 10;
+    private static final int TREE_BAMBOO = 11;
+    private static final int FEATURE_CANDIDATE_HEIGHT_SHIFT = 16;
+    private static final int FEATURE_CANDIDATE_HEIGHT_MASK = 0xFF;
+
+    /** Fixed salt distinguishing this hash from any other seed-derived synthetic feature. */
+    private static final long SALT = 0x27220A5FA9A9A797L;
+    private static final long CLEARING_SALT = 0x6A09E667F3BCC909L;
+    private static final long HEIGHT_SALT = 0xBB67AE8584CAA73BL;
+    private static final long MIX_X = 0x9E3779B185EBCA87L;
+    private static final long MIX_Z = 0xC2B2AE3D27D4EB4FL;
+    /** {@code treeCover} (a [0,1] double) is tested against this many low bits of the hash. */
+    private static final double PROBABILITY_SCALE = 4294967296.0; // 2^32
+    /** Each canopy anchor owns a 4x4-block cell ({@link #canopyBlob}). */
+    private static final double CELL_AREA = 16.0;
+    /**
+     * Average pixel count of a radius-1-or-2 digital disc: radius 1 covers 5 pixels (the center
+     * plus the four orthogonal neighbors), radius 2 covers 13 (a 5x5 square minus the four
+     * corner pairs at distance {@code sqrt(8) > 2}); the 50/50 radius pick averages to 9.
+     */
+    private static final double AVG_BLOB_AREA = 9.0;
+
+    private CanopyStylizer() {
+    }
+
+    public static void apply(
+        final DerivedGrid derived, final BaselineGrid grid, final long seed, final int lod, final int tileOriginX, final int tileOriginZ
+    ) {
+        applySynthetic(derived, grid, seed, lod, tileOriginX, tileOriginZ);
+    }
+
+    public static void applyWindow(
+        final DerivedGrid derived,
+        final BaselineGrid grid,
+        final long seed,
+        final int lod,
+        final int tileOriginX,
+        final int tileOriginZ,
+        final int minPixelX,
+        final int minPixelZ,
+        final int maxPixelX,
+        final int maxPixelZ
+    ) {
+        if (lod < 2 || minPixelX < 0 || minPixelZ < 0
+            || maxPixelX >= BaselineGrid.PIXELS || maxPixelZ >= BaselineGrid.PIXELS
+            || minPixelX > maxPixelX || minPixelZ > maxPixelZ) {
+            throw new IllegalArgumentException("invalid canopy window");
+        }
+        applySyntheticWindow(
+            derived, grid, seed, lod, tileOriginX, tileOriginZ,
+            minPixelX, minPixelZ, maxPixelX, maxPixelZ, null
+        );
+    }
+
+    /** Uses native natural features when available, with per-chunk or full-tile synthetic fallback. */
+    public static void apply(
+        final DerivedGrid derived, final BaselineGrid grid, final BaselineSampler sampler,
+        final long seed, final int lod, final int tileOriginX, final int tileOriginZ
+    ) {
+        if (sampler != null && lod <= MAX_NATURAL_LOD
+            && applyNatural(derived, grid, sampler, seed, lod, tileOriginX, tileOriginZ)) {
+            return;
+        }
+        applySynthetic(derived, grid, seed, lod, tileOriginX, tileOriginZ);
+    }
+
+    private static void applySynthetic(
+        final DerivedGrid derived, final BaselineGrid grid, final long seed,
+        final int lod, final int tileOriginX, final int tileOriginZ
+    ) {
+        applySynthetic(derived, grid, seed, lod, tileOriginX, tileOriginZ, null);
+    }
+
+    private static void applySynthetic(
+        final DerivedGrid derived, final BaselineGrid grid, final long seed,
+        final int lod, final int tileOriginX, final int tileOriginZ, final Set<Long> chunks
+    ) {
+        applySyntheticWindow(
+            derived, grid, seed, lod, tileOriginX, tileOriginZ,
+            -BaselineGrid.MARGIN, -BaselineGrid.MARGIN,
+            BaselineGrid.PIXELS - 1 + BaselineGrid.MARGIN,
+            BaselineGrid.PIXELS - 1 + BaselineGrid.MARGIN,
+            chunks
+        );
+    }
+
+    private static void applySyntheticWindow(
+        final DerivedGrid derived,
+        final BaselineGrid grid,
+        final long seed,
+        final int lod,
+        final int tileOriginX,
+        final int tileOriginZ,
+        final int minPixelX,
+        final int minPixelZ,
+        final int maxPixelX,
+        final int maxPixelZ,
+        final Set<Long> chunks
+    ) {
+        final int bpp = 1 << lod;
+        for (int pz = minPixelZ; pz <= maxPixelZ; pz++) {
+            for (int px = minPixelX; px <= maxPixelX; px++) {
+                final int idx = BaselineGrid.index(px, pz);
+                // Sub-samples run their own biome/kind checks: a forest sub-sample inside a
+                // treeless centre pixel still needs canopy, so this cannot sit behind the
+                // centre pixel's guards below.
+                stylizeSubSamples(derived, grid, seed, idx, px, pz);
+                final SurfaceKind kind = SurfaceKind.byOrdinal(derived.kind[idx]);
+                if (kind == SurfaceKind.WATER || kind == SurfaceKind.ICE || kind == SurfaceKind.VOID) {
+                    continue;
+                }
+                final double treeCover = BiomeTable.get(grid.biomeId[idx]).treeCover();
+                if (treeCover <= 0.0) {
+                    continue;
+                }
+                final int bx = tileOriginX + px * bpp;
+                final int bz = tileOriginZ + pz * bpp;
+                if (chunks != null && !chunks.contains(chunkKey(Math.floorDiv(bx, 16), Math.floorDiv(bz, 16)))) {
+                    continue;
+                }
+                final int bump = lod <= 1 ? canopyBlob(seed, bx, bz, treeCover) : canopyPoint(seed, bx, bz, treeCover);
+                if (bump > 0) {
+                    derived.kind[idx] = (byte) SurfaceKind.FOLIAGE.ordinal();
+                    derived.surfaceY[idx] += bump;
+                }
+            }
+        }
+    }
+
+    /**
+     * Runs the same per-pixel canopy test on each biome sub-sample. Only reachable at LOD &ge; 2,
+     * where {@link #canopyPoint} is already an independent per-position Bernoulli draw, so a
+     * sub-sample needs nothing but its own world position. Without this the colour average would
+     * blend stylized canopy against unstylized sub-samples of the same forest.
+     */
+    private static void stylizeSubSamples(
+        final DerivedGrid derived, final BaselineGrid grid, final long seed,
+        final int idx, final int px, final int pz
+    ) {
+        if (!grid.supersampled()) {
+            return;
+        }
+        for (int sz = 0; sz < grid.subPerAxis; sz++) {
+            for (int sx = 0; sx < grid.subPerAxis; sx++) {
+                final int s = grid.subIndex(idx, sx, sz);
+                final SurfaceKind subKind = SurfaceKind.byOrdinal(derived.subKind[s]);
+                if (subKind == SurfaceKind.WATER || subKind == SurfaceKind.ICE
+                    || subKind == SurfaceKind.VOID) {
+                    continue;
+                }
+                final double subCover = BiomeTable.get(grid.subBiomeId[s]).treeCover();
+                if (subCover <= 0.0) {
+                    continue;
+                }
+                final int subBump = canopyPoint(
+                    seed, grid.subBlockX(px, sx), grid.subBlockZ(pz, sz), subCover
+                );
+                if (subBump > 0) {
+                    derived.subKind[s] = (byte) SurfaceKind.FOLIAGE.ordinal();
+                    derived.subSurfaceY[s] += subBump;
+                }
+            }
+        }
+    }
+
+    private static boolean applyNatural(
+        final DerivedGrid derived, final BaselineGrid grid, final BaselineSampler sampler,
+        final long seed, final int lod, final int tileOriginX, final int tileOriginZ
+    ) {
+        final int blocksPerPixel = 1 << lod;
+        final int minBlockX = tileOriginX - BaselineGrid.MARGIN * blocksPerPixel;
+        final int minBlockZ = tileOriginZ - BaselineGrid.MARGIN * blocksPerPixel;
+        final int maxBlockX = tileOriginX
+            + (BaselineGrid.PIXELS - 1 + BaselineGrid.MARGIN) * blocksPerPixel;
+        final int maxBlockZ = tileOriginZ
+            + (BaselineGrid.PIXELS - 1 + BaselineGrid.MARGIN) * blocksPerPixel;
+        final int minChunkX = Math.floorDiv(minBlockX, 16);
+        final int minChunkZ = Math.floorDiv(minBlockZ, 16);
+        final int maxChunkX = Math.floorDiv(maxBlockX, 16);
+        final int maxChunkZ = Math.floorDiv(maxBlockZ, 16);
+        final TreeCandidate[] chunkCandidates = new TreeCandidate[MAX_CANDIDATES_PER_CHUNK];
+        final List<TreeCandidate> candidates = new ArrayList<>();
+        final Set<Long> fallbackChunks = new HashSet<>();
+
+        for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; chunkZ++) {
+            for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
+                final int count = sampler.treeCandidates(chunkX, chunkZ, chunkCandidates);
+                if (count == BaselineSampler.TREES_UNSUPPORTED) {
+                    fallbackChunks.add(chunkKey(chunkX, chunkZ));
+                    continue;
+                }
+                if (count < 0 || count > chunkCandidates.length) {
+                    return false;
+                }
+                for (int i = 0; i < count; i++) {
+                    final TreeCandidate candidate = chunkCandidates[i];
+                    if (candidate == null) {
+                        return false;
+                    }
+                    candidates.add(candidate);
+                }
+            }
+        }
+
+        final int[] baseSurfaceY = derived.surfaceY.clone();
+        if (!fallbackChunks.isEmpty()) {
+            applySynthetic(derived, grid, seed, lod, tileOriginX, tileOriginZ, fallbackChunks);
+        }
+        for (final TreeCandidate candidate : candidates) {
+            paintCandidate(derived, baseSurfaceY, candidate, lod, tileOriginX, tileOriginZ);
+        }
+        return true;
+    }
+
+    private static long chunkKey(final int chunkX, final int chunkZ) {
+        return ((long) chunkX << 32) | (chunkZ & 0xFFFFFFFFL);
+    }
+
+    private static void paintCandidate(
+        final DerivedGrid derived, final int[] baseSurfaceY,
+        final TreeCandidate candidate, final int lod, final int tileOriginX, final int tileOriginZ
+    ) {
+        final int blocksPerPixel = 1 << lod;
+        final int radius = canopyRadius(candidate.type()) + blocksPerPixel / 2;
+        final int minPixelX = Math.max(
+            -BaselineGrid.MARGIN,
+            Math.floorDiv(candidate.x() - radius - tileOriginX, blocksPerPixel)
+        );
+        final int maxPixelX = Math.min(
+            BaselineGrid.PIXELS - 1 + BaselineGrid.MARGIN,
+            Math.floorDiv(candidate.x() + radius - tileOriginX, blocksPerPixel)
+        );
+        final int minPixelZ = Math.max(
+            -BaselineGrid.MARGIN,
+            Math.floorDiv(candidate.z() - radius - tileOriginZ, blocksPerPixel)
+        );
+        final int maxPixelZ = Math.min(
+            BaselineGrid.PIXELS - 1 + BaselineGrid.MARGIN,
+            Math.floorDiv(candidate.z() + radius - tileOriginZ, blocksPerPixel)
+        );
+        final int centerOffset = blocksPerPixel / 2;
+        final int bump = candidateHeight(candidate);
+        final boolean foliage = candidate.type() != TREE_BAMBOO;
+
+        for (int pixelZ = minPixelZ; pixelZ <= maxPixelZ; pixelZ++) {
+            final int dz = tileOriginZ + pixelZ * blocksPerPixel + centerOffset - candidate.z();
+            for (int pixelX = minPixelX; pixelX <= maxPixelX; pixelX++) {
+                final int dx = tileOriginX + pixelX * blocksPerPixel + centerOffset - candidate.x();
+                if (dx * dx + dz * dz > radius * radius) {
+                    continue;
+                }
+                final int index = BaselineGrid.index(pixelX, pixelZ);
+                final SurfaceKind kind = SurfaceKind.byOrdinal(derived.kind[index]);
+                if (kind == SurfaceKind.WATER || kind == SurfaceKind.ICE || kind == SurfaceKind.VOID) {
+                    continue;
+                }
+                if (foliage) {
+                    derived.kind[index] = (byte) SurfaceKind.FOLIAGE.ordinal();
+                }
+                derived.surfaceY[index] = Math.max(derived.surfaceY[index], baseSurfaceY[index] + bump);
+            }
+        }
+    }
+
+    private static int canopyRadius(final int type) {
+        return switch (type) {
+            case TREE_BAMBOO -> 0;
+            case TREE_MANGROVE -> 3;
+            case TREE_CHERRY -> 4;
+            case TREE_JUNGLE, TREE_DARK_OAK, TREE_HUGE_BROWN_MUSHROOM, TREE_HUGE_RED_MUSHROOM -> 2;
+            default -> 1;
+        };
+    }
+
+    private static int candidateHeight(final TreeCandidate candidate) {
+        if (candidate.type() == TREE_BAMBOO) {
+            final int stalkHeight = (candidate.flags() >>> FEATURE_CANDIDATE_HEIGHT_SHIFT)
+                & FEATURE_CANDIDATE_HEIGHT_MASK;
+            return stalkHeight + 1;
+        }
+        return canopyHeight(candidate.type());
+    }
+
+    private static int canopyHeight(final int type) {
+        return switch (type) {
+            case TREE_JUNGLE -> 10;
+            case TREE_MANGROVE -> 8;
+            case TREE_CHERRY -> 10;
+            case TREE_DARK_OAK, TREE_HUGE_BROWN_MUSHROOM, TREE_HUGE_RED_MUSHROOM -> 4;
+            case TREE_JUNGLE_BUSH -> 2;
+            default -> 3;
+        };
+    }
+
+    /**
+     * Returns the height bump if {@code (bx, bz)} falls inside a triggered cell's blob, else 0.
+     * The per-cell trigger probability is scaled up from raw {@code treeCover} by the
+     * cell-area/blob-area ratio so the <em>effective areal coverage</em> of all blobs matches
+     * {@code treeCover} - a bare {@code treeCover} roll would only achieve that fraction times
+     * the blob/cell area ratio, leaving canopy looking far sparser than the table implies.
+     */
+    private static int canopyBlob(final long seed, final int bx, final int bz, final double treeCover) {
+        final boolean dense = treeCover >= 0.5;
+        final boolean foliage = dense
+            ? !insideBlob(seed ^ CLEARING_SALT, bx, bz, 1.0 - treeCover)
+            : insideBlob(seed, bx, bz, treeCover);
+        if (!foliage) {
+            return 0;
+        }
+        final int baseHeight = treeCover >= 0.75 ? 7 : 3;
+        return baseHeight + smoothHeight(seed, bx, bz);
+    }
+
+    private static boolean insideBlob(
+        final long seed,
+        final int bx,
+        final int bz,
+        final double coverage
+    ) {
+        if (coverage <= 0.0) {
+            return false;
+        }
+        final int myCellX = Math.floorDiv(bx, 4);
+        final int myCellZ = Math.floorDiv(bz, 4);
+        final double anchorProb = Math.min(1.0, coverage * CELL_AREA / AVG_BLOB_AREA);
+        for (int dz = -1; dz <= 1; dz++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                final int originX = (myCellX + dx) * 4;
+                final int originZ = (myCellZ + dz) * 4;
+                final long hash = hash(seed, originX, originZ);
+                if (!bernoulli(hash, anchorProb)) {
+                    continue;
+                }
+                final int radius = 1 + (int) ((hash >>> 40) & 1L);
+                final int centerX = originX + (int) ((hash >>> 41) & 3L);
+                final int centerZ = originZ + (int) ((hash >>> 43) & 3L);
+                final int ddx = bx - centerX;
+                final int ddz = bz - centerZ;
+                if (ddx * ddx + ddz * ddz <= radius * radius) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static int smoothHeight(final long seed, final int bx, final int bz) {
+        final int cellX = Math.floorDiv(bx, 4);
+        final int cellZ = Math.floorDiv(bz, 4);
+        final int fx = bx - cellX * 4;
+        final int fz = bz - cellZ * 4;
+        final int top = lerpHeight(
+            heightValue(seed, cellX, cellZ),
+            heightValue(seed, cellX + 1, cellZ),
+            fx
+        );
+        final int bottom = lerpHeight(
+            heightValue(seed, cellX, cellZ + 1),
+            heightValue(seed, cellX + 1, cellZ + 1),
+            fx
+        );
+        return lerpHeight(top, bottom, fz);
+    }
+
+    private static int heightValue(final long seed, final int cellX, final int cellZ) {
+        return (int) ((hash(seed ^ HEIGHT_SALT, cellX, cellZ) >>> 40) & 3L);
+    }
+
+    private static int lerpHeight(final int from, final int to, final int offset) {
+        return from + Math.floorDiv((to - from) * offset, 4);
+    }
+
+    private static int canopyPoint(final long seed, final int bx, final int bz, final double treeCover) {
+        return bernoulli(hash(seed, bx, bz), treeCover) ? 2 : 0;
+    }
+
+    private static boolean bernoulli(final long hash, final double probability) {
+        final long threshold = (long) (probability * PROBABILITY_SCALE);
+        final long sample = hash & 0xFFFFFFFFL;
+        return sample < threshold;
+    }
+
+    private static long hash(final long seed, final int bx, final int bz) {
+        long h = splitmix64(seed ^ SALT);
+        h = splitmix64(h ^ (long) bx * MIX_X);
+        h = splitmix64(h ^ (long) bz * MIX_Z);
+        return h;
+    }
+
+    private static long splitmix64(final long input) {
+        long x = input + 0x9E3779B97F4A7C15L;
+        x = (x ^ (x >>> 30)) * 0xBF58476D1CE4E5B9L;
+        x = (x ^ (x >>> 27)) * 0x94D049BB133111EBL;
+        return x ^ (x >>> 31);
+    }
+}

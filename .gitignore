@@ -1,0 +1,55 @@
+# gradle
+
+.gradle/
+build/
+out/
+classes/
+tools/
+
+# eclipse
+
+*.launch
+
+# idea
+
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# vscode
+
+.settings/
+.vscode/
+bin/
+.classpath
+.project
+
+# macos
+
+*.DS_Store
+
+# fabric
+
+run/
+versions/*/run-*/
+versions/*/logs/
+artifacts/
+
+# worktrees
+
+.worktrees/
+
+# local publishing credentials
+
+cf-token.txt
+
+# java
+
+hs_err_*.log
+replay_*.log
+*.hprof
+*.jfr
+
+CLAUDE.md
+AGENTS.md

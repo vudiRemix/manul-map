@@ -1,0 +1,179 @@
+package cn.net.rms.confluxmap.compat;
+
+import net.minecraft.block.Block;
+import net.minecraft.entity.EntityType;
+import net.minecraft.item.Item;
+import net.minecraft.util.Identifier;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.world.World;
+import net.minecraft.world.biome.Biome;
+import net.minecraft.world.chunk.WorldChunk;
+
+//#if MC>=11903
+//$$ import net.minecraft.registry.Registries;
+//$$ import net.minecraft.registry.Registry;
+//$$ import net.minecraft.registry.RegistryKey;
+//$$ import net.minecraft.registry.RegistryKeys;
+//#else
+import net.minecraft.util.registry.Registry;
+//#endif
+
+import java.util.Optional;
+
+/**
+ * The one place that knows how this Minecraft version exposes registries.
+ *
+ * <p>Three separate breaks are folded in here: 1.19.3 moved the registry classes out of
+ * {@code net.minecraft.util.registry} and split the static keys into {@code Registries} /
+ * {@code RegistryKeys}, 1.21.3 replaced {@code DynamicRegistryManager.get} with
+ * {@code getOrThrow}, and 1.21.5 replaced {@code Registry.getOrEmpty} with
+ * {@code getOptionalValue}. Since 1.18 a world also hands out a {@code RegistryEntry<Biome>}
+ * rather than a bare {@code Biome}, so biome lookups go through {@link #biomeIdAt} instead of
+ * leaking that type difference into callers.
+ */
+public final class Regs {
+    private Regs() {
+    }
+
+    /** The biome registry backing {@code world}. */
+    public static Registry<Biome> biomes(final World world) {
+        //#if MC>=12103
+        //$$ return world.getRegistryManager().getOrThrow(RegistryKeys.BIOME);
+        //#elseif MC>=11903
+        //$$ return world.getRegistryManager().get(RegistryKeys.BIOME);
+        //#else
+        return world.getRegistryManager().get(Registry.BIOME_KEY);
+        //#endif
+    }
+
+    /** The static block registry. */
+    public static Registry<Block> blocks() {
+        //#if MC>=11903
+        //$$ return Registries.BLOCK;
+        //#else
+        return Registry.BLOCK;
+        //#endif
+    }
+
+    /** The static item registry. */
+    public static Registry<Item> items() {
+        //#if MC>=11903
+        //$$ return Registries.ITEM;
+        //#else
+        return Registry.ITEM;
+        //#endif
+    }
+
+    /** The static entity-type registry. */
+    public static Registry<EntityType<?>> entityTypes() {
+        //#if MC>=11903
+        //$$ return Registries.ENTITY_TYPE;
+        //#else
+        return Registry.ENTITY_TYPE;
+        //#endif
+    }
+
+    /** Looks up a biome without exposing the registry API rename at 1.21.3. */
+    public static Biome biome(final Registry<Biome> registry, final Identifier id) {
+        //#if MC>=12103
+        //$$ return registry.getOptionalValue(id).orElse(null);
+        //#else
+        return registry.get(id);
+        //#endif
+    }
+
+    /**
+     * Looks a block up by identifier. Deliberately not {@code blocks().get(id)}: the block
+     * registry is defaulted, so an unknown id silently resolves to air instead of reporting
+     * absence, which would turn "unknown block" into "block with the air map colour".
+     */
+    public static Optional<Block> block(final Identifier id) {
+        //#if MC>=12105
+        //$$ return blocks().getOptionalValue(id);
+        //#else
+        return blocks().getOrEmpty(id);
+        //#endif
+    }
+
+    /** Looks an item up by identifier without defaulting an unknown id to air. */
+    public static Optional<Item> item(final Identifier id) {
+        //#if MC>=12105
+        //$$ return items().getOptionalValue(id);
+        //#else
+        return items().getOrEmpty(id);
+        //#endif
+    }
+
+    /** Looks an entity type up by identifier without depending on generated constant owners. */
+    public static Optional<EntityType<?>> entityType(final Identifier id) {
+        //#if MC>=12105
+        //$$ return entityTypes().getOptionalValue(id);
+        //#else
+        return entityTypes().getOrEmpty(id);
+        //#endif
+    }
+
+    /** The registry identifier of an entity type. */
+    public static Identifier entityTypeId(final EntityType<?> type) {
+        //#if MC>=260100
+        //$$ return entityTypes().getKey(type);
+        //#else
+        return entityTypes().getId(type);
+        //#endif
+    }
+
+    /** The registry identifier of {@code block}. */
+    public static Identifier blockId(final Block block) {
+        //#if MC>=260100
+        //$$ return blocks().getKey(block);
+        //#else
+        return blocks().getId(block);
+        //#endif
+    }
+
+    /** The registry identifier of {@code item}. */
+    public static Identifier itemId(final Item item) {
+        //#if MC>=260100
+        //$$ return items().getKey(item);
+        //#else
+        return items().getId(item);
+        //#endif
+    }
+
+    /** The registry identifier of the biome at {@code pos}, or null when it has none. */
+    public static Identifier biomeIdAt(final World world, final BlockPos pos) {
+        //#if MC>=11903
+        //$$ return world.getBiome(pos).getKey().map(RegistryKey::getValue).orElse(null);
+        //#elseif MC>=11800
+        //$$ return biomes(world).getId(world.getBiome(pos).value());
+        //#else
+        return biomes(world).getId(world.getBiome(pos));
+        //#endif
+    }
+
+    /**
+     * The registry identifier of the biome stored in {@code chunk}'s own container at block
+     * coords, or null when it has none.
+     *
+     * <p>Unlike {@link #biomeIdAt} this never consults the level: the biome manager's voronoi
+     * lookup reads neighbouring chunks, which from a chunk load/unload listener means querying
+     * the chunk system from inside a chunk transition (under C2ME that re-enters main-thread
+     * task polling until the watchdog kills the server). The stored container is also what the
+     * Anvil and Paper paths sample, so live and disk summaries now agree at biome boundaries.
+     */
+    public static Identifier chunkBiomeIdAt(
+        final World world,
+        final WorldChunk chunk,
+        final int x,
+        final int y,
+        final int z
+    ) {
+        //#if MC>=11903
+        //$$ return chunk.getBiomeForNoiseGen(x >> 2, y >> 2, z >> 2).getKey().map(RegistryKey::getValue).orElse(null);
+        //#elseif MC>=11800
+        //$$ return biomes(world).getId(chunk.getBiomeForNoiseGen(x >> 2, y >> 2, z >> 2).value());
+        //#else
+        return biomes(world).getId(chunk.getBiomeArray().getBiomeForNoiseGen(x >> 2, y >> 2, z >> 2));
+        //#endif
+    }
+}

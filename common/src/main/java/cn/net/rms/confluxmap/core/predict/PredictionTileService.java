@@ -1,0 +1,1778 @@
+package cn.net.rms.confluxmap.core.predict;
+
+import cn.net.rms.confluxmap.core.color.DaylightModel;
+import cn.net.rms.confluxmap.core.color.LightTint;
+import cn.net.rms.confluxmap.core.color.MapColorStyle;
+import cn.net.rms.confluxmap.core.color.ShadingPipeline;
+import cn.net.rms.confluxmap.core.color.XaeroMapStyle;
+import cn.net.rms.confluxmap.core.model.DimensionId;
+import cn.net.rms.confluxmap.core.model.MapLayer;
+import cn.net.rms.confluxmap.core.model.SurfaceKind;
+import cn.net.rms.confluxmap.core.model.TileKey;
+import cn.net.rms.confluxmap.core.net.ChunkPatchCodec;
+import cn.net.rms.confluxmap.core.net.CorrectionProfile;
+import cn.net.rms.confluxmap.core.net.MapSyncCompatibility;
+import cn.net.rms.confluxmap.core.net.PatchCodec;
+import cn.net.rms.confluxmap.core.net.Proto;
+import cn.net.rms.confluxmap.core.store.ColumnStore;
+import cn.net.rms.confluxmap.core.task.MapExecutors;
+import cn.net.rms.confluxmap.core.task.SessionGuard;
+import cn.net.rms.confluxmap.core.tile.BiomeTileKeys;
+import cn.net.rms.confluxmap.core.tile.TileService;
+import cn.net.rms.confluxmap.core.tile.TileUpdate;
+import cn.net.rms.confluxmap.core.util.Argb;
+import cn.net.rms.confluxmap.core.util.ChunkRegionSlice;
+import cn.net.rms.confluxmap.core.util.TileMath;
+import cn.net.rms.confluxmap.nativepredict.CubiomesContexts;
+import cn.net.rms.confluxmap.nativepredict.PredictorVersion;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.OptionalInt;
+import java.util.Set;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.LongSupplier;
+
+/**
+ * Predicted-underlay twin of {@code core.tile.TileService}: a synchronized dirty-tile queue
+ * bounded by an in-flight cap (one per worker outside a visible viewport, a small bounded cap
+ * inside one that still picks tiles in top-left row-major order, and user-waited menu-target
+ * tiles always first), session-token guarded - same discipline,
+ * entirely separate data. Predictions never enter {@code ColumnStore}/{@code
+ * RegionDiskCache}; composition here samples cubiomes directly (via {@link NativeBaselineSampler})
+ * and shares {@code TileService}'s upload queue through {@link TileService#submitUpload}. Native
+ * availability, a known seed, and a supported dimension all gate every request - see {@link
+ * PredictionState#predictable} - so a missing seed or a native-load failure degrades to a silent
+ * no-op rather than an error anywhere in this class.
+ */
+public final class PredictionTileService {
+    public enum LowerCoverageState {
+        READY,
+        PENDING,
+        MISSING_OR_STALE
+    }
+
+    /** Re-entry freshness window for corrections; expiry never schedules background polling. */
+    public static final long CORRECTION_REUSE_TTL_MS = 30L * 60L * 1_000L;
+    /** About 38 MiB worst case; enough for one ordinary fullscreen viewport plus its next mip. */
+    private static final int REUSABLE_TILE_LIMIT = 64;
+    private final SessionGuard sessionGuard;
+    private final PredictionState state;
+    private final MapExecutors executors;
+    private final TileService uploads;
+    private final LongSupplier millisClock;
+    private final int maxConcurrentCompositions;
+    /**
+     * Bounded concurrency while a fullscreen viewport is active. Strict serialization (1) left the
+     * predicted underlay trailing the real tile's transparent unexplored pixels during pans, so the
+     * screen background bled through as black gaps; row-major ordering still picks the next tile.
+     */
+    private static final int VISIBLE_CONCURRENCY = 6;
+    private volatile CorrectionStore correctionStore;
+    private volatile DaylightModel daylightModel;
+    private volatile PredictionViewMode viewMode = PredictionViewMode.EVERYWHERE;
+    private volatile MapColorStyle mapColorStyle = MapColorStyle.CONFLUX;
+
+    /** Guarded by {@code this}: tiles waiting to be composed, with the session token that requested them. */
+    private final Map<TileKey, Long> dirty = new HashMap<>();
+    /** Guarded by {@code this}: tiles currently being composed on a worker. */
+    private final Set<TileKey> inFlight = new HashSet<>();
+    /**
+     * Guarded by {@code this}: queued tiles a map action is actively waiting on (a right-click
+     * menu target). Dispatched before the viewport row-major order; the flag is consumed by
+     * the composition that finishes the tile.
+     */
+    private final Set<TileKey> urgent = new HashSet<>();
+    /** Prediction variants requested or uploaded at least once this session. */
+    private final Set<TileKey> requestedTiles = new HashSet<>();
+    /** Tracked textures that were last composed under an older view mode. */
+    private final Set<TileKey> staleViewModeTiles = new HashSet<>();
+    /** Tracked textures whose local real-map coverage changed while they were off-screen. */
+    private final Set<TileKey> staleRealCoverageTiles = new HashSet<>();
+    /** Guarded by {@code this}: output-pixel metadata retained for fullscreen cursor/actions. */
+    private final Map<TileKey, TileMetadata> metadataTiles = new HashMap<>();
+    /** Recent CPU results used to build a coarser tile without resampling. */
+    private final PredictionMipCache mipCache = new PredictionMipCache(REUSABLE_TILE_LIMIT);
+    private final SyncedMaterialPalette syncedMaterials = new SyncedMaterialPalette();
+    /** Parent tiles waiting for one bounded disk-backed lower-LOD reduction. */
+    private final LinkedHashMap<TileKey, Long> lowerCoverageQueue = new LinkedHashMap<>();
+    private final Set<TileKey> lowerCoverageInFlight = new HashSet<>();
+    private final Set<TileKey> missingLowerCoverage = new HashSet<>();
+    private long lowerCoverageGeneration;
+    /** Guarded by {@code this}: invalidates compositions started before a manual/session reload. */
+    private long reloadGeneration;
+
+    /** Latest fullscreen viewport; visible predictions are scheduled in row-major order. */
+    private ViewportRect viewport;
+
+    private volatile int viewpointX;
+    private volatile int viewpointZ;
+    private volatile int netherBiomeY = PredictionDimensions.NETHER_ROOF_Y;
+    /** Guarded by {@code this}: rejects current-layer compositions started at an older pivot Y. */
+    private long netherBiomeGeneration;
+
+    public PredictionTileService(
+        final SessionGuard sessionGuard,
+        final PredictionState state,
+        final MapExecutors executors,
+        final TileService uploads
+    ) {
+        this(sessionGuard, state, executors, uploads, System::currentTimeMillis);
+    }
+
+    public PredictionTileService(
+        final SessionGuard sessionGuard,
+        final PredictionState state,
+        final MapExecutors executors,
+        final TileService uploads,
+        final LongSupplier millisClock
+    ) {
+        this.sessionGuard = sessionGuard;
+        this.state = state;
+        this.executors = executors;
+        this.uploads = uploads;
+        this.millisClock = millisClock;
+        this.maxConcurrentCompositions = Math.max(1, executors.workerCount());
+        uploads.bindRealCoverageListener(this::onRealCoverageChanged);
+        uploads.bindPredictedUploadReloader(this::requestTile);
+    }
+
+    private void onRealCoverageChanged(final TileKey realKey) {
+        final SessionGuard.Session session = sessionGuard.current();
+        final MapLayer layer;
+        try {
+            layer = MapLayer.parse(BiomeTileKeys.realLayerId(realKey.layerId()));
+        } catch (final IllegalArgumentException e) {
+            return;
+        }
+        if (!session.active()
+            || !realKey.world().equals(session.world())
+            || !realKey.dimension().equals(session.dimension())) {
+            return;
+        }
+        boolean queued = false;
+        synchronized (this) {
+            if (isLowerNetherLayer(realKey.dimension(), layer)) {
+                queueRealCoverageRefresh(
+                    PredictedTileKeys.toPredicted(BiomeTileKeys.toBiome(realKey)),
+                    session.token()
+                );
+                queued = true;
+            } else if (layer.equals(PredictionDimensions.layer(session.dimension()))) {
+                queueRealCoverageRefresh(PredictedTileKeys.toPredicted(realKey), session.token());
+                queueRealCoverageRefresh(
+                    PredictedTileKeys.toPredicted(BiomeTileKeys.toBiome(realKey)), session.token()
+                );
+                queued = true;
+            }
+        }
+        if (queued) {
+            pump();
+        }
+    }
+
+    /** Caller must hold the monitor. */
+    private void queueRealCoverageRefresh(final TileKey key, final long token) {
+        invalidateCachedTileAndAncestors(key);
+        if (requestedTiles.contains(key)) {
+            staleRealCoverageTiles.add(key);
+            if (viewport != null && viewport.contains(key)) {
+                dirty.put(key, token);
+            }
+        }
+    }
+
+    public void bindCorrectionStore(final CorrectionStore store) {
+        this.correctionStore = store;
+    }
+
+    public void bindDaylightModel(final DaylightModel model) {
+        this.daylightModel = model;
+    }
+
+    public void setMapColorStyle(final MapColorStyle style) {
+        mapColorStyle = style == null ? MapColorStyle.CONFLUX : style;
+    }
+
+    public SyncedMaterialPalette syncedMaterials() {
+        return syncedMaterials;
+    }
+
+    public void setViewMode(final PredictionViewMode mode) {
+        final PredictionViewMode nextMode = mode == null ? PredictionViewMode.EVERYWHERE : mode;
+        final SessionGuard.Session session = sessionGuard.current();
+        synchronized (this) {
+            if (nextMode == viewMode) {
+                return;
+            }
+            viewMode = nextMode;
+            staleViewModeTiles.addAll(requestedTiles);
+            if (viewport != null && session.active()
+                && viewport.dimension().equals(session.dimension())) {
+                for (final TileKey key : staleViewModeTiles) {
+                    if (viewport.contains(key)) {
+                        dirty.put(key, session.token());
+                    }
+                }
+            }
+        }
+        pump();
+    }
+
+    public PredictionViewMode viewMode() {
+        return viewMode;
+    }
+
+    private AppliedLighting applyLayerLighting(
+        final TileKey key,
+        final int[] pixels,
+        final byte[] blockLight,
+        final MapColorStyle style
+    ) {
+        if (BiomeTileKeys.isBiome(key)) {
+            return AppliedLighting.NONE;
+        }
+        final String realLayer = BiomeTileKeys.baseLayerId(key);
+        final MapLayer.Type layer = MapLayer.parse(realLayer).type();
+        final DaylightModel model = daylightModel;
+        final DaylightModel.State lighting = model == null
+            ? new DaylightModel.State(1f, 0f)
+            : model.state();
+        final float gamma = lighting.gamma();
+        if (layer == MapLayer.Type.NETHER_CEILING) {
+            // Captured Xaero roof tiles keep their zero-light ambient bake untouched
+            // (TileService's composeXaeroColumn applies no light replacement to
+            // NETHER_CEILING), so the prediction must match instead of being re-lit.
+            if (style != MapColorStyle.XAERO) {
+                for (int pixel = 0; pixel < pixels.length; pixel++) {
+                    pixels[pixel] = LightTint.applyBlockLightOverAmbient(
+                        pixels[pixel], blockLight[pixel] & 0xFF, true, gamma
+                    );
+                }
+            }
+            return AppliedLighting.NONE;
+        }
+        if (layer == MapLayer.Type.END_SURFACE) {
+            // The End plane composes with the zero-light ambient baked in (see composeTile);
+            // the per-column block-light plane replaces it here, matching TileService's
+            // raw END_SURFACE composition. The Xaero style composes without the bake (its
+            // terrain shading adds light, which a ratio replace cannot invert) and takes the
+            // curve applied over the shaded pixel, exactly like captured Xaero End tiles.
+            for (int pixel = 0; pixel < pixels.length; pixel++) {
+                pixels[pixel] = style == MapColorStyle.XAERO
+                    ? LightTint.applyBlockLightTint(
+                        pixels[pixel], blockLight[pixel] & 0xFF, false, gamma
+                    )
+                    : LightTint.applyBlockLightOverAmbient(
+                        pixels[pixel], blockLight[pixel] & 0xFF, false, gamma
+                    );
+            }
+            return AppliedLighting.NONE;
+        }
+        if (layer != MapLayer.Type.SURFACE) {
+            return AppliedLighting.NONE;
+        }
+        if (model == null) {
+            return AppliedLighting.NONE;
+        }
+        final float factor = lighting.daylight();
+        for (int pixel = 0; pixel < pixels.length; pixel++) {
+            pixels[pixel] = style == MapColorStyle.XAERO
+                ? Argb.scale(
+                    pixels[pixel],
+                    ShadingPipeline.applyGamma(
+                        XaeroMapStyle.daylightScale(factor, blockLight[pixel] & 0xFF), gamma
+                    )
+                )
+                : ShadingPipeline.applyDaylight(
+                    pixels[pixel], factor, blockLight[pixel] & 0xFF, gamma
+                );
+        }
+        return new AppliedLighting(factor, gamma);
+    }
+
+    private static TileUpdate tileUpdate(
+        final TileKey key,
+        final int[] pixels,
+        final byte[] blockLight,
+        final float composedDaylight,
+        final float composedGamma,
+        final MapColorStyle style
+    ) {
+        return Float.isNaN(composedDaylight)
+            ? TileUpdate.fullTile(key, pixels)
+            : TileUpdate.fullTile(
+                key, pixels, new TileUpdate.Relight(
+                    composedDaylight, composedGamma, blockLight, style
+                )
+            );
+    }
+
+    private static long[] unknownPixelRevisions() {
+        final long[] revisions = new long[PatchCodec.PIXELS];
+        java.util.Arrays.fill(revisions, Long.MIN_VALUE);
+        return revisions;
+    }
+
+    /**
+     * Composes one immutable CPU tile under an explicit view mode without mutating the visible
+     * viewport, GPU upload queue, metadata cache, or the globally selected prediction mode.
+     */
+    public CompletableFuture<int[]> snapshotTile(
+        final TileKey key,
+        final PredictionViewMode mode
+    ) {
+        final SessionGuard.Session session = sessionGuard.current();
+        if (!session.active()
+            || !key.world().equals(session.world())
+            || !key.dimension().equals(session.dimension())) {
+            return CompletableFuture.failedFuture(new CancellationException("Map session changed"));
+        }
+        return CompletableFuture.supplyAsync(() -> {
+            final Composition composition = composeTile(
+                key, session.token(), mode, netherBiomeY
+            );
+            if (composition == null) {
+                return null;
+            }
+            return composition.update().argbPixels();
+        }, executors.workers());
+    }
+
+    /** Applies a server patch and queues the affected predicted tile for recomposition. */
+    public boolean applyCorrection(
+        final CorrectionStore.Key key, final long revision, final byte[] presence,
+        final PatchCodec.Patch patch
+    ) {
+        return applyCorrection(key, revision, presence, patch, System.currentTimeMillis());
+    }
+
+    public boolean applyRegionCorrection(
+        final String dimension,
+        final int lod,
+        final ChunkRegionSlice slice,
+        final ChunkPatchCodec.Patch patch,
+        final long validatedAtMillis
+    ) {
+        return applyRegionCorrection(
+            dimension, lod, slice, patch,
+            Proto.PATCH_MODE_RESIDUAL,
+            MapSyncCompatibility.STABLE_PREDICTOR,
+            validatedAtMillis
+        );
+    }
+
+    public boolean applyRegionCorrection(
+        final String dimension,
+        final int lod,
+        final ChunkRegionSlice slice,
+        final ChunkPatchCodec.Patch patch,
+        final int patchMode,
+        final String baselineProfile,
+        final long validatedAtMillis
+    ) {
+        return applyRegionCorrection(
+            dimension, lod, slice, patch, patchMode, baselineProfile, validatedAtMillis,
+            CorrectionProfile.SOURCE_LIGHT_V2
+        );
+    }
+
+    public boolean applyRegionCorrection(
+        final String dimension,
+        final int lod,
+        final ChunkRegionSlice slice,
+        final ChunkPatchCodec.Patch patch,
+        final int patchMode,
+        final String baselineProfile,
+        final long validatedAtMillis,
+        final CorrectionProfile correctionProfile
+    ) {
+        final CorrectionStore store = state.manualSeed() ? null : correctionStore;
+        if (store == null || !store.applyRegionSlice(
+            dimension, lod, slice, patch, patchMode, baselineProfile, validatedAtMillis,
+            correctionProfile
+        )) {
+            return false;
+        }
+        markCorrectionDirty(regionKey(dimension, lod, slice));
+        return true;
+    }
+
+    public boolean validateRegionCorrection(
+        final String dimension,
+        final int lod,
+        final ChunkRegionSlice slice,
+        final long revision,
+        final long validatedAtMillis
+    ) {
+        return validateRegionCorrection(
+            dimension, lod, slice, revision, validatedAtMillis,
+            CorrectionProfile.SOURCE_LIGHT_V2
+        );
+    }
+
+    public boolean validateRegionCorrection(
+        final String dimension,
+        final int lod,
+        final ChunkRegionSlice slice,
+        final long revision,
+        final long validatedAtMillis,
+        final CorrectionProfile correctionProfile
+    ) {
+        final CorrectionStore store = state.manualSeed() ? null : correctionStore;
+        if (store == null || !store.validateRegionSlice(
+            dimension, lod, slice, revision, validatedAtMillis, correctionProfile
+        )) {
+            return false;
+        }
+        markCorrectionDirty(regionKey(dimension, lod, slice));
+        return true;
+    }
+
+    public boolean invalidateRegionCorrection(
+        final String dimension, final int lod, final ChunkRegionSlice slice
+    ) {
+        final CorrectionStore store = state.manualSeed() ? null : correctionStore;
+        if (store == null || !store.invalidateRegionSlice(dimension, lod, slice)) {
+            return false;
+        }
+        final CorrectionStore.Key key = regionKey(dimension, lod, slice);
+        final SessionGuard.Session session = sessionGuard.current();
+        final TileKey tile = correctionTile(session, key);
+        if (tile == null) {
+            return true;
+        }
+        synchronized (this) {
+            lowerCoverageGeneration++;
+            missingLowerCoverage.clear();
+            mipCache.removeCoverage(tile);
+        }
+        return true;
+    }
+
+    public boolean applyCorrection(
+        final CorrectionStore.Key key,
+        final long revision,
+        final byte[] presence,
+        final PatchCodec.Patch patch,
+        final long validatedAtMillis
+    ) {
+        return applyCorrection(
+            key, revision, presence, patch,
+            Proto.PATCH_MODE_RESIDUAL,
+            MapSyncCompatibility.STABLE_PREDICTOR,
+            validatedAtMillis
+        );
+    }
+
+    public boolean applyCorrection(
+        final CorrectionStore.Key key,
+        final long revision,
+        final byte[] presence,
+        final PatchCodec.Patch patch,
+        final int patchMode,
+        final String baselineProfile,
+        final long validatedAtMillis
+    ) {
+        return applyCorrection(
+            key, revision, presence, patch, patchMode, baselineProfile, validatedAtMillis,
+            CorrectionProfile.SOURCE_LIGHT_V2
+        );
+    }
+
+    public boolean applyCorrection(
+        final CorrectionStore.Key key,
+        final long revision,
+        final byte[] presence,
+        final PatchCodec.Patch patch,
+        final int patchMode,
+        final String baselineProfile,
+        final long validatedAtMillis,
+        final CorrectionProfile correctionProfile
+    ) {
+        final CorrectionStore store = state.manualSeed() ? null : correctionStore;
+        if (store == null || !store.apply(
+            key, revision, presence, patch, patchMode, baselineProfile, validatedAtMillis,
+            correctionProfile
+        )) {
+            return false;
+        }
+        markCorrectionDirty(key);
+        return true;
+    }
+
+    /** Validates an unchanged committed correction snapshot. */
+    public boolean validateCorrection(
+        final CorrectionStore.Key key,
+        final long revision,
+        final byte[] presence,
+        final long validatedAtMillis
+    ) {
+        return validateCorrection(
+            key, revision, presence, validatedAtMillis,
+            CorrectionProfile.SOURCE_LIGHT_V2
+        );
+    }
+
+    public boolean validateCorrection(
+        final CorrectionStore.Key key,
+        final long revision,
+        final byte[] presence,
+        final long validatedAtMillis,
+        final CorrectionProfile correctionProfile
+    ) {
+        final CorrectionStore store = correctionStore;
+        if (store == null || !store.validate(
+            key, revision, presence, validatedAtMillis, correctionProfile
+        )) {
+            return false;
+        }
+        markCorrectionDirty(key);
+        return true;
+    }
+
+    /** Records uncommitted scan progress without replacing or recomposing the drawable snapshot. */
+    public boolean applyPartialCorrection(
+        final CorrectionStore.Key key,
+        final byte[] presence,
+        final PatchCodec.Patch patch
+    ) {
+        final CorrectionStore store = correctionStore;
+        if (store == null || !store.applyPartial(key, presence, patch)) {
+            return false;
+        }
+        final SessionGuard.Session session = sessionGuard.current();
+        final TileKey tile = correctionTile(session, key);
+        if (tile == null) {
+            return true;
+        }
+        synchronized (this) {
+            mipCache.removeCoverage(tile);
+        }
+        return true;
+    }
+
+    /** Invalidates correction freshness and every derived mip while keeping the uploaded tile visible. */
+    public boolean invalidateCorrectionValidation(final CorrectionStore.Key key) {
+        return invalidateCorrectionValidations(List.of(key));
+    }
+
+    /** Applies one server invalidation batch without rewriting the persistent journal per tile. */
+    public boolean invalidateCorrectionValidations(final Collection<CorrectionStore.Key> keys) {
+        final CorrectionStore store = correctionStore;
+        if (store == null || keys == null || keys.isEmpty()) {
+            return false;
+        }
+        final boolean changed = store.invalidateCoverages(keys);
+        final SessionGuard.Session session = sessionGuard.current();
+        synchronized (this) {
+            lowerCoverageGeneration++;
+            missingLowerCoverage.clear();
+            for (final CorrectionStore.Key key : keys) {
+                if (key == null) {
+                    continue;
+                }
+                final TileKey tile = correctionTile(session, key);
+                if (tile == null) {
+                    continue;
+                }
+                mipCache.removeCoverage(tile);
+            }
+        }
+        return changed;
+    }
+
+    private void markCorrectionDirty(final CorrectionStore.Key key) {
+        final SessionGuard.Session session = sessionGuard.current();
+        final TileKey tile = correctionTile(session, key);
+        if (tile == null) {
+            return;
+        }
+        synchronized (this) {
+            lowerCoverageGeneration++;
+            missingLowerCoverage.clear();
+            invalidateCachedTileAndAncestors(tile);
+        }
+        markDirty(tile, session.token());
+        markBiomeDirtyIfRequested(BiomeTileKeys.toBiome(tile), session.token());
+    }
+
+    private static CorrectionStore.Key regionKey(
+        final String dimension, final int lod, final ChunkRegionSlice slice
+    ) {
+        final int chunksPerTile = 16 << lod;
+        return new CorrectionStore.Key(
+            dimension,
+            lod,
+            Math.floorDiv(slice.minChunkX(), chunksPerTile),
+            Math.floorDiv(slice.minChunkZ(), chunksPerTile)
+        );
+    }
+
+    private static TileKey correctionTile(
+        final SessionGuard.Session session, final CorrectionStore.Key key
+    ) {
+        final DimensionId dimension = DimensionId.parse(key.dimension());
+        final MapLayer layer = PredictionDimensions.layer(dimension);
+        if (!session.active() || layer == null || !dimension.equals(session.dimension())) {
+            return null;
+        }
+        return new TileKey(
+            session.world(), dimension, layer.cacheId() + PredictedTileKeys.SUFFIX,
+            key.lod(), key.tileX(), key.tileZ()
+        );
+    }
+
+    /** Main thread, from the session tracker: forget every queued/in-flight predicted tile, and invalidate cached native contexts. */
+    public void onSessionChanged(final SessionGuard.Session session) {
+        synchronized (this) {
+            reloadGeneration++;
+            lowerCoverageGeneration++;
+            dirty.clear();
+            urgent.clear();
+            requestedTiles.clear();
+            staleViewModeTiles.clear();
+            staleRealCoverageTiles.clear();
+            metadataTiles.clear();
+            mipCache.clear();
+            lowerCoverageQueue.clear();
+            missingLowerCoverage.clear();
+        }
+        CubiomesContexts.bumpEpoch();
+    }
+
+    /**
+     * Drops every queued/uploaded prediction and invalidates native contexts. Visible tiles are
+     * requested again by the next map render, making this a clean diagnostic reload without
+     * touching real-map tiles or persisted server corrections.
+     */
+    public void reloadAll() {
+        final SessionGuard.Session session = sessionGuard.current();
+        synchronized (this) {
+            reloadGeneration++;
+            lowerCoverageGeneration++;
+            dirty.clear();
+            urgent.clear();
+            staleViewModeTiles.clear();
+            staleRealCoverageTiles.clear();
+            metadataTiles.clear();
+            mipCache.clear();
+            lowerCoverageQueue.clear();
+            missingLowerCoverage.clear();
+            if (session.active()) {
+                for (final TileKey key : inFlight) {
+                    if (key.world().equals(session.world()) && key.dimension().equals(session.dimension())) {
+                        dirty.put(key, session.token());
+                    }
+                }
+            }
+        }
+        uploads.discardUploads(PredictedTileKeys::isPredicted);
+        CubiomesContexts.bumpEpoch();
+        pump();
+    }
+
+    /** Where the viewer currently is, for dirty-tile composition priority (mirrors {@code TileService#setViewpoint}). */
+    public void setViewpoint(final int blockX, final int blockZ) {
+        viewpointX = blockX;
+        viewpointZ = blockZ;
+    }
+
+    /** Updates the debounced Y used by the live Nether current-layer biome plane. */
+    public void setNetherBiomeY(final int blockY) {
+        final SessionGuard.Session session = sessionGuard.current();
+        synchronized (this) {
+            if (netherBiomeY == blockY) {
+                return;
+            }
+            netherBiomeY = blockY;
+            netherBiomeGeneration++;
+            for (final TileKey key : requestedTiles) {
+                if (isCurrentNetherBiomeKey(key)) {
+                    invalidateCachedTileAndAncestors(key);
+                    dirty.put(key, session.token());
+                }
+            }
+        }
+        pump();
+    }
+
+    /** Recompose selected-source tiles after the player's local-authority boundary moves. */
+    public void refreshLiveCoverage() {
+        final SessionGuard.Session session = sessionGuard.current();
+        if (!session.active()) {
+            return;
+        }
+        synchronized (this) {
+            for (final TileKey key : requestedTiles) {
+                if (key.world().equals(session.world())
+                    && key.dimension().equals(session.dimension())) {
+                    queueRealCoverageRefresh(key, session.token());
+                }
+            }
+        }
+        pump();
+    }
+
+    /**
+     * Called once per frame by the fullscreen map with the exact range of predicted tiles it's
+     * about to draw; prunes any queued request outside that rect (a 1-tile pad beyond it is kept,
+     * so a tile that's about to be scrolled into view isn't discarded and immediately
+     * re-requested) or at a different LOD/dimension - e.g. after a zoom change, stale requests
+     * for the previous LOD are dropped rather than wastefully composed.
+     */
+    public void setViewport(
+        final DimensionId dimension, final int lod, final int minTileX, final int maxTileX, final int minTileZ, final int maxTileZ
+    ) {
+        final ViewportRect rect = new ViewportRect(dimension, lod, minTileX, maxTileX, minTileZ, maxTileZ);
+        final SessionGuard.Session session = sessionGuard.current();
+        synchronized (this) {
+            final boolean changed = !rect.equals(viewport);
+            viewport = rect;
+            dirty.keySet().removeIf(key -> {
+                if (rect.containsPadded(key)) {
+                    return false;
+                }
+                urgent.remove(key);
+                return true;
+            });
+            metadataTiles.keySet().removeIf(key -> !rect.containsPadded(key));
+            if (changed && session.active() && dimension.equals(session.dimension()) && lod > 0) {
+                final MapLayer predictedLayer = PredictionDimensions.layer(dimension);
+                if (predictedLayer == null) {
+                    return;
+                }
+                final String layer = predictedLayer.cacheId();
+                for (int tileZ = minTileZ; tileZ <= maxTileZ; tileZ++) {
+                    for (int tileX = minTileX; tileX <= maxTileX; tileX++) {
+                        final TileKey key = new TileKey(
+                            session.world(), dimension, layer + PredictedTileKeys.SUFFIX,
+                            lod, tileX, tileZ
+                        );
+                        if (mipCache.lowerCoverageValidatedAt(key, viewMode) != PredictionMipCache.MISSING) {
+                            dirty.put(key, session.token());
+                        }
+                    }
+                }
+            }
+            if (changed && session.active() && dimension.equals(session.dimension())) {
+                for (final TileKey key : staleViewModeTiles) {
+                    if (rect.contains(key)) {
+                        dirty.put(key, session.token());
+                    }
+                }
+                for (final TileKey key : staleRealCoverageTiles) {
+                    if (rect.contains(key)) {
+                        dirty.put(key, session.token());
+                    }
+                }
+            }
+        }
+        pump();
+    }
+
+    /** Clears fullscreen ordering after the screen closes. */
+    public void clearViewport() {
+        synchronized (this) {
+            viewport = null;
+            metadataTiles.clear();
+        }
+        pump();
+    }
+
+    /**
+     * Predicted biome at one visible fullscreen-map pixel, using the same LOD sample that produced
+     * the rendered tile. Returns empty until that tile has composed, when prediction is hidden at
+     * the pixel, or when the requested dimension is not the active predictable session.
+     */
+    public OptionalInt predictedBiomeAt(
+        final DimensionId dimension,
+        final int lod,
+        final int blockX,
+        final int blockZ
+    ) {
+        return predictedBiomeAt(
+            dimension, PredictionDimensions.layer(dimension), lod, blockX, blockZ
+        );
+    }
+
+    /** Predicted biome on the requested fullscreen layer, including Nether height planes. */
+    public OptionalInt predictedBiomeAt(
+        final DimensionId dimension,
+        final MapLayer layer,
+        final int lod,
+        final int blockX,
+        final int blockZ
+    ) {
+        final PixelLookup lookup = visiblePixelLookup(
+            dimension, layer, lod, blockX, blockZ
+        );
+        if (lookup == null) {
+            return OptionalInt.empty();
+        }
+        final TileMetadata metadata;
+        synchronized (this) {
+            metadata = metadataTiles.get(lookup.key());
+        }
+        if (metadata == null) {
+            // GPU textures can outlive viewport metadata. Rehydrate this one tile lazily when the
+            // cursor returns to it; requestTile is idempotent while a composition is queued/running.
+            requestTile(lookup.requestKey());
+            return OptionalInt.empty();
+        }
+        return OptionalInt.of(Byte.toUnsignedInt(metadata.biomes()[lookup.pixel()]));
+    }
+
+    /** Predicted highest surface block at the same visible pixel used by the underlay. */
+    public OptionalInt predictedSurfaceYAt(
+        final DimensionId dimension,
+        final int lod,
+        final int blockX,
+        final int blockZ
+    ) {
+        return surfaceLookupAt(dimension, lod, blockX, blockZ, false).surfaceY();
+    }
+
+    /**
+     * Predicted ground at one visible fullscreen-map pixel, distinguishing a composed void
+     * column ({@code known} with no surface Y) from a tile that has not composed yet. A
+     * missing tile is queued ahead of the viewport order, because a map action is waiting on
+     * it.
+     */
+    public ColumnStore.SurfaceLookup predictedSurfaceAt(
+        final DimensionId dimension,
+        final int lod,
+        final int blockX,
+        final int blockZ
+    ) {
+        return surfaceLookupAt(dimension, lod, blockX, blockZ, true);
+    }
+
+    private ColumnStore.SurfaceLookup surfaceLookupAt(
+        final DimensionId dimension,
+        final int lod,
+        final int blockX,
+        final int blockZ,
+        final boolean urgentRequest
+    ) {
+        final PixelLookup lookup = visiblePixelLookup(dimension, lod, blockX, blockZ);
+        if (lookup == null) {
+            return ColumnStore.SurfaceLookup.UNKNOWN;
+        }
+        final TileMetadata metadata;
+        synchronized (this) {
+            metadata = metadataTiles.get(lookup.key());
+        }
+        if (metadata == null) {
+            if (urgentRequest) {
+                requestTileUrgently(lookup.key());
+            } else {
+                requestTile(lookup.key());
+            }
+            return ColumnStore.SurfaceLookup.UNKNOWN;
+        }
+        final int surfaceY = metadata.surfaces()[lookup.pixel()];
+        return surfaceY == BaselineGrid.NO_SURFACE
+            ? new ColumnStore.SurfaceLookup(true, OptionalInt.empty())
+            : new ColumnStore.SurfaceLookup(true, OptionalInt.of(surfaceY));
+    }
+
+    /**
+     * For a predicted tile that's visible but has never been composed. The authoritative
+     * availability gate (native library loaded, seed known, dimension supported) lives in {@link
+     * #composeTile} rather than here - {@link cn.net.rms.confluxmap.mc.render.TileTextureManager}
+     * only ever routes here for a key {@code FullscreenMapScreen} already decided prediction is
+     * active for, and keeping this method's own check to just the session match makes the
+     * dirty-queue/viewport-pruning behavior independently testable without a loaded native
+     * library (see {@code PredictionTileServiceTest}).
+     */
+    public void requestTile(final TileKey key) {
+        final SessionGuard.Session session = sessionGuard.current();
+        if (!key.world().equals(session.world()) || !key.dimension().equals(session.dimension())) {
+            return;
+        }
+        synchronized (this) {
+            requestedTiles.add(key);
+            // The renderer retries a missing texture every frame. Keep that retry idempotent so
+            // one slow native composition cannot continuously requeue itself.
+            if (dirty.containsKey(key) || inFlight.contains(key)) {
+                return;
+            }
+            dirty.put(key, session.token());
+        }
+        pump();
+    }
+
+    /**
+     * Queues one tile a map action is actively waiting on - a right-click menu target whose
+     * surface height gates teleport - ahead of the viewport and background order. Idempotent
+     * while queued or in flight, exactly like {@link #requestTile}; the urgent flag is consumed
+     * by the composition that finishes the tile.
+     */
+    public void requestTileUrgently(final TileKey key) {
+        final SessionGuard.Session session = sessionGuard.current();
+        if (!key.world().equals(session.world()) || !key.dimension().equals(session.dimension())) {
+            return;
+        }
+        synchronized (this) {
+            requestedTiles.add(key);
+            urgent.add(key);
+            if (dirty.containsKey(key) || inFlight.contains(key)) {
+                return;
+            }
+            dirty.put(key, session.token());
+        }
+        pump();
+    }
+
+    private void markBiomeDirtyIfRequested(final TileKey key, final long token) {
+        synchronized (this) {
+            if (!requestedTiles.contains(key)) {
+                return;
+            }
+        }
+        markDirty(key, token);
+    }
+
+    private void markDirty(final TileKey key, final long token) {
+        synchronized (this) {
+            dirty.put(key, token);
+            if (inFlight.contains(key)) {
+                return;
+            }
+        }
+        pump();
+    }
+
+    private void pump() {
+        while (true) {
+            final TileKey next;
+            final long token;
+            final long generation;
+            final long netherGeneration;
+            final int netherY;
+            synchronized (this) {
+                final int compositionLimit = viewport == null
+                    ? maxConcurrentCompositions
+                    : Math.min(maxConcurrentCompositions, VISIBLE_CONCURRENCY);
+                if (inFlight.size() >= compositionLimit || dirty.isEmpty()) {
+                    return;
+                }
+                next = nearestDirty();
+                if (next == null) {
+                    return;
+                }
+                token = dirty.remove(next);
+                generation = reloadGeneration;
+                netherGeneration = netherBiomeGeneration;
+                netherY = netherBiomeY;
+                inFlight.add(next);
+            }
+            executors.workers().execute(() -> composeAndFinish(
+                next, token, generation, netherGeneration, netherY
+            ));
+        }
+    }
+
+    /** Caller must hold the monitor. */
+    private TileKey nearestDirty() {
+        final int vx = viewpointX;
+        final int vz = viewpointZ;
+        final ViewportRect activeViewport = viewport;
+        TileKey best = null;
+        int bestTier = Integer.MAX_VALUE;
+        long bestDist = Long.MAX_VALUE;
+        for (final TileKey key : dirty.keySet()) {
+            if (inFlight.contains(key)) {
+                continue;
+            }
+            // 0 = user-waited (menu target), 1 = visible viewport, 2 = background.
+            final int tier = urgent.contains(key) ? 0
+                : activeViewport != null && activeViewport.contains(key) ? 1 : 2;
+            if (best == null || tier < bestTier) {
+                best = key;
+                bestTier = tier;
+                bestDist = distanceToViewpoint(key, vx, vz);
+                continue;
+            }
+            if (tier != bestTier) {
+                continue;
+            }
+            if (tier == 2) {
+                final long dist = distanceToViewpoint(key, vx, vz);
+                if (dist < bestDist) {
+                    bestDist = dist;
+                    best = key;
+                }
+            } else if (rowMajorBefore(key, best)) {
+                best = key;
+            }
+        }
+        return best;
+    }
+
+    private static long distanceToViewpoint(final TileKey key, final int vx, final int vz) {
+        final long half = 128L << key.lod();
+        final long dx = key.originBlockX() + half - vx;
+        final long dz = key.originBlockZ() + half - vz;
+        return dx * dx + dz * dz;
+    }
+
+    private static boolean rowMajorBefore(final TileKey candidate, final TileKey current) {
+        return candidate.tileZ() < current.tileZ()
+            || (candidate.tileZ() == current.tileZ() && candidate.tileX() < current.tileX());
+    }
+
+    private void composeAndFinish(
+        final TileKey key,
+        final long token,
+        final long generation,
+        final long netherGeneration,
+        final int netherY
+    ) {
+        Composition composition = null;
+        try {
+            composition = composeTile(key, token, viewMode, netherY);
+        } finally {
+            synchronized (this) {
+                if (composition != null && generation == reloadGeneration
+                    && (!isCurrentNetherBiomeKey(key)
+                        || netherGeneration == netherBiomeGeneration)
+                    && composition.mode() == viewMode) {
+                    requestedTiles.add(key);
+                    metadataTiles.put(metadataKey(key), composition.metadata());
+                    mipCache.put(key, new PredictionMipCache.Tile(
+                        composition.update().argbPixels(),
+                        composition.metadata().biomes(),
+                        composition.metadata().surfaces(),
+                        composition.syncEvaluated(),
+                        composition.syncSourceRevisions(),
+                        composition.blockLight(),
+                        composition.composedDaylight(),
+                        composition.composedGamma(),
+                        composition.mode(),
+                        composition.hasServerState(),
+                        composition.freshnessValidatedAtMillis(),
+                        composition.serverCoverageValidatedAtMillis(),
+                        composition.correctionProfile()
+                    ));
+                    staleViewModeTiles.remove(key);
+                    staleRealCoverageTiles.remove(key);
+                    invalidateCachedAncestorsAndQueueVisible(key, token);
+                    uploads.submitUpload(composition.update());
+                }
+                inFlight.remove(key);
+                urgent.remove(key);
+            }
+            pump();
+        }
+    }
+
+    /** A whole-dimension flat surface declares the same top material in every quadrant. */
+    private static String[] uniformFlatMaterials(final String topMaterialId) {
+        return new String[] {topMaterialId, topMaterialId, topMaterialId, topMaterialId};
+    }
+
+    private Composition composeTile(final TileKey key, final long token) {
+        return composeTile(key, token, viewMode, netherBiomeY);
+    }
+
+    private Composition composeTile(
+        final TileKey key,
+        final long token,
+        final PredictionViewMode requestedMode,
+        final int currentNetherY
+    ) {
+        final SessionGuard.Session session = sessionGuard.current();
+        if (!sessionGuard.isCurrent(token) || !session.active()
+            || !key.world().equals(session.world()) || !key.dimension().equals(session.dimension())
+            || !state.predictable(key.dimension())) {
+            return null;
+        }
+        final int nativeDim = PredictionDimensions.nativeDim(key.dimension());
+        if (nativeDim == Integer.MIN_VALUE) {
+            return null;
+        }
+        final MapLayer expectedLayer = PredictionDimensions.layer(key.dimension());
+        final MapLayer requestedLayer;
+        try {
+            requestedLayer = MapLayer.parse(BiomeTileKeys.baseLayerId(key));
+        } catch (final IllegalArgumentException e) {
+            return null;
+        }
+        final boolean lowerNetherBiome = BiomeTileKeys.isBiome(key)
+            && isLowerNetherLayer(key.dimension(), requestedLayer);
+        if (!requestedLayer.equals(expectedLayer) && !lowerNetherBiome) {
+            return null;
+        }
+        final int netherY = requestedLayer.type() == MapLayer.Type.NETHER_SLICE
+            ? requestedLayer.param()
+            : currentNetherY;
+
+        final boolean end = PredictionDimensions.isEnd(key.dimension());
+        final int lod = key.lod();
+        final int tileOriginX = key.originBlockX();
+        final int tileOriginZ = key.originBlockZ();
+        final PredictionViewMode compositionMode = requestedMode == null
+            ? PredictionViewMode.EVERYWHERE
+            : requestedMode;
+
+        final PredictionMipCache.Tile lower = mipCache.lowerTile(key, compositionMode);
+        final CorrectionStore store = lowerNetherBiome || state.manualSeed()
+            ? null : correctionStore;
+        final CorrectionTile storedCorrections = store == null
+            ? null
+            : store.get(key.dimension(), lod, key.tileX(), key.tileZ());
+        final CorrectionTile directCorrections = supportsCorrectionBaseline(
+            storedCorrections, PredictorVersion.full()
+        ) ? storedCorrections : null;
+        final boolean directHasServerState = directCorrections != null
+            && directCorrections.hasCommittedState();
+        final long directValidatedAt = directCorrections == null
+            ? 0L
+            : directCorrections.reusableValidatedAtMillis();
+        final long nowMillis = millisClock.getAsLong();
+        final boolean lowerFresh = lower != null
+            && lower.isVisuallyReusableAt(nowMillis, CORRECTION_REUSE_TTL_MS);
+        if (lowerFresh && (!directHasServerState
+            || directValidatedAt == 0L
+            || lower.freshnessValidatedAtMillis() >= directValidatedAt)) {
+            final Composition composition = new Composition(
+                tileUpdate(
+                    key,
+                    lower.pixels(),
+                    lower.blockLight(),
+                    lower.composedDaylight(),
+                    lower.composedGamma(),
+                    mapColorStyle
+                ),
+                new TileMetadata(lower.biomes(), lower.surfaces()),
+                lower.syncEvaluated(),
+                lower.syncSourceRevisions(),
+                lower.blockLight(),
+                lower.composedDaylight(),
+                lower.composedGamma(),
+                lower.mode(),
+                lower.hasServerState(),
+                lower.freshnessValidatedAtMillis(),
+                lower.serverCoverageValidatedAtMillis(),
+                lower.correctionProfile()
+            );
+            uploads.maskPredictedPixels(
+                realKey(key), composition.update().argbPixels(),
+                lower.syncEvaluated(), lower.syncSourceRevisions(),
+                lower.correctionProfile()
+            );
+            return composition;
+        }
+
+        final BaselineGrid grid;
+        final DerivedGrid derived;
+        final int baselineMapColorId;
+        final QuadrantLayout quadrants = state.quadrantLayout(key.dimension());
+        final QuadrantLayout.Mask quadrantMask;
+        if (lowerNetherBiome) {
+            final BaselineSampler sampler = new NativeBaselineSampler(
+                state.mcVersion(), state.seed(), nativeDim,
+                state.cubiomesFlags(key.dimension())
+            );
+            grid = LodSampling.sampleNetherBiomesAtY(
+                sampler, lod, tileOriginX, tileOriginZ, netherY
+            );
+            if (grid == null) {
+                return null;
+            }
+            // Only flat quadrants carry a configured uniform biome; cleared quadrants keep the
+            // real sampled biomes quadra-gen preserved.
+            if (quadrants != null) {
+                quadrants.applyBiomes(grid);
+            }
+            derived = BaselineDeriver.derive(grid);
+            baselineMapColorId = Proto.MAP_COLOR_NONE;
+            quadrantMask = null;
+        } else {
+            final FlatBaseline flat = state.flatBaseline(key.dimension());
+            if (state.preset(key.dimension()) == WorldPreset.FLAT && flat != null) {
+                // Superflat: every column is the same known surface - no seed, no native sampling.
+                grid = flat.toBaselineGrid();
+                derived = flat.toDerivedGrid();
+                baselineMapColorId = flat.mapColorId();
+                quadrantMask = flat.topMaterialId().isEmpty() ? null
+                    : new QuadrantLayout.Mask(null, uniformFlatMaterials(flat.topMaterialId()));
+            } else {
+                final long seed = state.seed();
+                final BaselineSampler sampler = new NativeBaselineSampler(
+                    state.mcVersion(), seed, nativeDim, state.cubiomesFlags(key.dimension())
+                );
+                grid = key.dimension().equals(DimensionId.NETHER)
+                    ? LodSampling.sampleNetherRoof(sampler, lod, tileOriginX, tileOriginZ)
+                    : LodSampling.sample(sampler, end, lod, tileOriginX, tileOriginZ);
+                if (grid == null) {
+                    return null;
+                }
+                derived = BaselineDeriver.derive(grid);
+                CanopyStylizer.apply(derived, grid, seed, lod, tileOriginX, tileOriginZ);
+                // Quadrant layouts (quadra-gen) overwrite their columns after derivation and
+                // canopy, so synthetic trees cannot survive in a cleared or flat quadrant. The
+                // companion's PatchBuilder masks its residual baseline with the same code.
+                quadrantMask = quadrants == null ? null : quadrants.apply(grid, derived);
+                // Terrain mode owns the roof material, while the separate biome composer below owns
+                // biome identity. Treat the fixed Nether plane like a uniform bedrock superflat.
+                baselineMapColorId = key.dimension().equals(DimensionId.NETHER)
+                    ? PredictionDimensions.NETHER_ROOF_MAP_COLOR_ID
+                    : Proto.MAP_COLOR_NONE;
+            }
+        }
+
+        final MapColorStyle style = mapColorStyle;
+        final XaeroMapStyle.Shadow shadow = XaeroMapStyle.shadowFor(key.dimension());
+        final int[] pixels = BiomeTileKeys.isBiome(key)
+            ? PredictedBiomeComposer.compose(
+                derived, grid, directCorrections, compositionMode, lod, derived, grid
+            )
+            : PredictedTileComposer.compose(
+                derived, grid, state.palette(), directCorrections, compositionMode, lod,
+                baselineMapColorId, derived, grid, baselineMapColorId,
+                !key.dimension().equals(DimensionId.NETHER),
+                key.dimension().equals(DimensionId.NETHER)
+                    ? LightTint.multiplier(0, 0, true)
+                    : key.dimension().equals(DimensionId.END) && style == MapColorStyle.CONFLUX
+                        // The End owes the cave dark-light contract too: bake the zero-light
+                        // ambient in here (baseline and corrections alike), then the per-column
+                        // block-light plane replaces it in applyLayerLighting. The Xaero style
+                        // bakes nothing - its terrain shading adds light, which the ambient
+                        // ratio-replace cannot invert - and instead takes the curve applied
+                        // over the shaded pixel, exactly like the captured Xaero End tiles.
+                        ? LightTint.multiplier(0, 0, false)
+                        : 0xFFFFFFFF,
+                syncedMaterials, style, shadow,
+                quadrantMask == null ? null : quadrantMask.mapColorOverrides(),
+                quadrantMask == null ? null : quadrantMask.topMaterials()
+            );
+        final byte[] syncEvaluated = directCorrections == null
+            ? new byte[PatchCodec.MASK_BYTES] : directCorrections.copyEvaluated();
+        final long[] syncSourceRevisions = directCorrections == null
+            ? unknownPixelRevisions() : directCorrections.copyPixelSourceRevisions();
+        final byte[] blockLight = directCorrections == null
+            ? new byte[PatchCodec.PIXELS] : directCorrections.copyBlockLight();
+        uploads.maskPredictedPixels(
+            realKey(key), pixels, syncEvaluated, syncSourceRevisions,
+            directCorrections == null
+                ? CorrectionProfile.LEGACY_V1 : directCorrections.correctionProfile()
+        );
+        final AppliedLighting appliedLighting = applyLayerLighting(
+            key, pixels, blockLight, style
+        );
+        final float composedDaylight = appliedLighting.daylight();
+        final float composedGamma = appliedLighting.gamma();
+        return new Composition(
+            tileUpdate(
+                key, pixels, blockLight, composedDaylight, composedGamma, style
+            ),
+            new TileMetadata(
+                biomeIds(grid, directCorrections, grid),
+                surfaceYs(derived, directCorrections, derived)
+            ),
+            syncEvaluated,
+            syncSourceRevisions,
+            blockLight,
+            composedDaylight,
+            composedGamma,
+            compositionMode,
+            directHasServerState,
+            directValidatedAt,
+            directHasServerState ? directValidatedAt : 0L,
+            directCorrections == null
+                ? CorrectionProfile.LEGACY_V1 : directCorrections.correctionProfile()
+        );
+    }
+
+    private static TileKey realKey(final TileKey predictedKey) {
+        return new TileKey(
+            predictedKey.world(), predictedKey.dimension(),
+            PredictedTileKeys.realLayerId(predictedKey.layerId()),
+            predictedKey.lod(), predictedKey.tileX(), predictedKey.tileZ()
+        );
+    }
+
+    /**
+     * Whether the parent can be reconstructed entirely from newer, committed lower-LOD results.
+     * This is also the network-sync admission seam: a true result means the server would only
+     * reproduce data the client already has.
+     */
+    public synchronized boolean hasFreshLowerCoverage(
+        final DimensionId dimension,
+        final int lod,
+        final int tileX,
+        final int tileZ,
+        final long nowMillis
+    ) {
+        final SessionGuard.Session session = sessionGuard.current();
+        if (!session.active() || lod <= 0 || lod > TileMath.MAX_LOD
+            || !dimension.equals(session.dimension())) {
+            return false;
+        }
+        final MapLayer predictedLayer = PredictionDimensions.layer(dimension);
+        if (predictedLayer == null) {
+            return false;
+        }
+        final String layer = predictedLayer.cacheId();
+        final TileKey parent = new TileKey(
+            session.world(), dimension, layer + PredictedTileKeys.SUFFIX, lod, tileX, tileZ
+        );
+        final PredictionMipCache.Tile exact = mipCache.exact(parent, viewMode);
+        final long exactValidatedAt = exact == null ? PredictionMipCache.MISSING
+            : exact.serverCoverageValidatedAtMillis();
+        final long validatedAt = exactValidatedAt != PredictionMipCache.MISSING
+            ? exactValidatedAt
+            : mipCache.lowerCoverageValidatedAt(parent, viewMode);
+        return validatedAt > 0L
+            && nowMillis >= validatedAt
+            && nowMillis - validatedAt <= CORRECTION_REUSE_TTL_MS;
+    }
+
+    /**
+     * Resolves complete lower-LOD correction coverage without blocking the render thread on disk
+     * or native prediction work. The reducer prefers the nearest fresh child LOD and recursively
+     * falls back to finer persisted tiles only where needed.
+     */
+    public LowerCoverageState prepareFreshLowerCoverage(
+        final DimensionId dimension,
+        final int lod,
+        final int tileX,
+        final int tileZ,
+        final long nowMillis
+    ) {
+        final SessionGuard.Session session = sessionGuard.current();
+        if (!session.active() || lod <= 0 || lod > TileMath.MAX_LOD
+            || !dimension.equals(session.dimension())) {
+            return LowerCoverageState.MISSING_OR_STALE;
+        }
+        final MapLayer predictedLayer = PredictionDimensions.layer(dimension);
+        if (predictedLayer == null) {
+            return LowerCoverageState.MISSING_OR_STALE;
+        }
+        final String layer = predictedLayer.cacheId();
+        final TileKey parent = new TileKey(
+            session.world(), dimension, layer + PredictedTileKeys.SUFFIX, lod, tileX, tileZ
+        );
+        synchronized (this) {
+            if (freshLowerCoverageAt(parent, nowMillis)) {
+                return LowerCoverageState.READY;
+            }
+            if (missingLowerCoverage.contains(parent)) {
+                return LowerCoverageState.MISSING_OR_STALE;
+            }
+            if (!lowerCoverageInFlight.contains(parent)) {
+                lowerCoverageQueue.putIfAbsent(parent, session.token());
+            }
+        }
+        pumpLowerCoverage();
+        return LowerCoverageState.PENDING;
+    }
+
+    /** Caller must hold the monitor. */
+    private boolean freshLowerCoverageAt(final TileKey parent, final long nowMillis) {
+        final PredictionMipCache.Tile exact = mipCache.exact(parent, viewMode);
+        final long validatedAt = exact != null && exact.serverCoverageValidatedAtMillis() > 0L
+            ? exact.serverCoverageValidatedAtMillis()
+            : mipCache.lowerCoverageValidatedAt(parent, viewMode);
+        return validatedAt > 0L
+            && nowMillis >= validatedAt
+            && nowMillis - validatedAt <= CORRECTION_REUSE_TTL_MS;
+    }
+
+    private void pumpLowerCoverage() {
+        final TileKey key;
+        final long token;
+        final long generation;
+        synchronized (this) {
+            if (executors.workers().isShutdown()) {
+                lowerCoverageQueue.clear();
+                lowerCoverageInFlight.clear();
+                return;
+            }
+            if (!lowerCoverageInFlight.isEmpty() || lowerCoverageQueue.isEmpty()) {
+                return;
+            }
+            final Map.Entry<TileKey, Long> next = lowerCoverageQueue.entrySet().iterator().next();
+            key = next.getKey();
+            token = next.getValue();
+            lowerCoverageQueue.remove(key);
+            lowerCoverageInFlight.add(key);
+            generation = lowerCoverageGeneration;
+        }
+        try {
+            executors.workers().execute(() -> reduceLowerCoverageAndFinish(key, token, generation));
+        } catch (final java.util.concurrent.RejectedExecutionException e) {
+            synchronized (this) {
+                lowerCoverageInFlight.remove(key);
+                lowerCoverageQueue.clear();
+            }
+        }
+    }
+
+    private void reduceLowerCoverageAndFinish(
+        final TileKey parent,
+        final long token,
+        final long generation
+    ) {
+        PredictionMipCache.Tile reduced = null;
+        try {
+            final long nowMillis = millisClock.getAsLong();
+            if (hasFreshPersistedChildren(parent, token, nowMillis)) {
+                reduced = reduceFreshChildren(parent, token, nowMillis, viewMode);
+            }
+        } finally {
+            synchronized (this) {
+                if (generation == lowerCoverageGeneration && sessionGuard.isCurrent(token)) {
+                    if (reduced == null) {
+                        missingLowerCoverage.add(parent);
+                    } else {
+                        mipCache.put(parent, reduced);
+                        metadataTiles.put(
+                            metadataKey(parent),
+                            new TileMetadata(reduced.biomes(), reduced.surfaces())
+                        );
+                        uploads.submitUpload(TileUpdate.fullTile(parent, reduced.pixels()));
+                    }
+                }
+                lowerCoverageInFlight.remove(parent);
+            }
+            pumpLowerCoverage();
+        }
+    }
+
+    /** Checks the complete persisted coverage before spending native work composing any child. */
+    private boolean hasFreshPersistedChildren(
+        final TileKey parent,
+        final long token,
+        final long nowMillis
+    ) {
+        if (parent.lod() <= 0 || !sessionGuard.isCurrent(token)) {
+            return false;
+        }
+        final CorrectionStore store = correctionStore;
+        if (store == null) {
+            return false;
+        }
+        for (int childZ = 0; childZ < 2; childZ++) {
+            for (int childX = 0; childX < 2; childX++) {
+                final TileKey childKey = new TileKey(
+                    parent.world(), parent.dimension(), parent.layerId(), parent.lod() - 1,
+                    parent.tileX() * 2 + childX, parent.tileZ() * 2 + childZ
+                );
+                final CorrectionTile correction = store.get(
+                    childKey.dimension(), childKey.lod(), childKey.tileX(), childKey.tileZ()
+                );
+                if (!correction.hasCommittedState()
+                    || !correction.isFreshAt(nowMillis, CORRECTION_REUSE_TTL_MS)) {
+                    if (!hasFreshPersistedChildren(childKey, token, nowMillis)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    private PredictionMipCache.Tile reduceFreshChildren(
+        final TileKey parent,
+        final long token,
+        final long nowMillis,
+        final PredictionViewMode mode
+    ) {
+        if (parent.lod() <= 0 || !sessionGuard.isCurrent(token)) {
+            return null;
+        }
+        final PredictionMipCache.Tile[] children = new PredictionMipCache.Tile[4];
+        for (int childZ = 0; childZ < 2; childZ++) {
+            for (int childX = 0; childX < 2; childX++) {
+                final TileKey childKey = new TileKey(
+                    parent.world(), parent.dimension(), parent.layerId(), parent.lod() - 1,
+                    parent.tileX() * 2 + childX, parent.tileZ() * 2 + childZ
+                );
+                final CorrectionStore store = correctionStore;
+                final CorrectionTile correction = store == null ? null : store.get(
+                    childKey.dimension(), childKey.lod(), childKey.tileX(), childKey.tileZ()
+                );
+                final PredictionMipCache.Tile child;
+                if (correction != null && correction.hasCommittedState()
+                    && correction.isFreshAt(nowMillis, CORRECTION_REUSE_TTL_MS)) {
+                    final Composition composition = composeTile(childKey, token);
+                    child = composition == null ? null : mipTile(composition);
+                } else {
+                    child = reduceFreshChildren(childKey, token, nowMillis, mode);
+                }
+                if (child == null) {
+                    return null;
+                }
+                children[childZ * 2 + childX] = child;
+            }
+        }
+        return PredictionMipCache.aggregate(children, mode);
+    }
+
+    private static PredictionMipCache.Tile mipTile(final Composition composition) {
+        return new PredictionMipCache.Tile(
+            composition.update().argbPixels(),
+            composition.metadata().biomes(),
+            composition.metadata().surfaces(),
+            composition.syncEvaluated(),
+            composition.syncSourceRevisions(),
+            composition.blockLight(),
+            composition.composedDaylight(),
+            composition.composedGamma(),
+            composition.mode(),
+            composition.hasServerState(),
+            composition.freshnessValidatedAtMillis(),
+            composition.serverCoverageValidatedAtMillis(),
+            composition.correctionProfile()
+        );
+    }
+
+    /** Caller must hold the monitor. */
+    private void invalidateCachedTileAndAncestors(final TileKey key) {
+        mipCache.remove(key);
+        TileKey ancestor = key;
+        while (ancestor.lod() < TileMath.MAX_LOD) {
+            ancestor = new TileKey(
+                ancestor.world(), ancestor.dimension(), ancestor.layerId(), ancestor.lod() + 1,
+                Math.floorDiv(ancestor.tileX(), 2), Math.floorDiv(ancestor.tileZ(), 2)
+            );
+            mipCache.remove(ancestor);
+        }
+    }
+
+    /** Caller must hold the monitor. */
+    private void invalidateCachedAncestorsAndQueueVisible(final TileKey key, final long token) {
+        TileKey ancestor = key;
+        while (ancestor.lod() < TileMath.MAX_LOD) {
+            ancestor = new TileKey(
+                ancestor.world(), ancestor.dimension(), ancestor.layerId(), ancestor.lod() + 1,
+                Math.floorDiv(ancestor.tileX(), 2), Math.floorDiv(ancestor.tileZ(), 2)
+            );
+            mipCache.remove(ancestor);
+            if (viewport != null && viewport.contains(ancestor)) {
+                dirty.put(ancestor, token);
+            }
+        }
+    }
+
+    static boolean supportsCorrectionBaseline(
+        final CorrectionTile corrections,
+        final String currentBaselineProfile
+    ) {
+        return corrections == null
+            || corrections.patchMode() == Proto.PATCH_MODE_ABSOLUTE
+            || corrections.baselineProfile().equals(currentBaselineProfile);
+    }
+
+    private static byte[] biomeIds(
+        final BaselineGrid grid,
+        final CorrectionTile corrections,
+        final BaselineGrid correctionGrid
+    ) {
+        final byte[] biomes = new byte[BaselineGrid.PIXELS * BaselineGrid.PIXELS];
+        for (int z = 0; z < BaselineGrid.PIXELS; z++) {
+            for (int x = 0; x < BaselineGrid.PIXELS; x++) {
+                biomes[z * BaselineGrid.PIXELS + x] = (byte) grid.biomeId[BaselineGrid.index(x, z)];
+            }
+        }
+        if (corrections != null) {
+            final PatchCodec.Patch correctionPatch = corrections.copyPatch();
+            if (corrections.patchMode() == Proto.PATCH_MODE_RESIDUAL) {
+                final byte[] evaluated = correctionPatch.evaluated();
+                for (int pixel = 0; pixel < biomes.length; pixel++) {
+                    if ((evaluated[pixel >>> 3] & (1 << (pixel & 7))) != 0) {
+                        biomes[pixel] = (byte) correctionGrid.biomeId[
+                            BaselineGrid.index(pixel & 255, pixel >>> 8)
+                        ];
+                    }
+                }
+            }
+            for (final PatchCodec.Sample sample : correctionPatch.samples()) {
+                if (SurfaceKind.byOrdinal(sample.kind()) == SurfaceKind.UNKNOWN) {
+                    final int pixel = sample.pixelIndex();
+                    biomes[pixel] = (byte) grid.biomeId[
+                        BaselineGrid.index(pixel & 255, pixel >>> 8)
+                    ];
+                } else {
+                    biomes[sample.pixelIndex()] = (byte) sample.biomeId();
+                }
+            }
+        }
+        return biomes;
+    }
+
+    private static int[] surfaceYs(
+        final DerivedGrid derived,
+        final CorrectionTile corrections,
+        final DerivedGrid correctionDerived
+    ) {
+        final int[] surfaces = new int[BaselineGrid.PIXELS * BaselineGrid.PIXELS];
+        for (int z = 0; z < BaselineGrid.PIXELS; z++) {
+            for (int x = 0; x < BaselineGrid.PIXELS; x++) {
+                surfaces[z * BaselineGrid.PIXELS + x] = derived.surfaceY[BaselineGrid.index(x, z)];
+            }
+        }
+        if (corrections != null) {
+            final PatchCodec.Patch correctionPatch = corrections.copyPatch();
+            if (corrections.patchMode() == Proto.PATCH_MODE_RESIDUAL) {
+                final byte[] evaluated = correctionPatch.evaluated();
+                for (int pixel = 0; pixel < surfaces.length; pixel++) {
+                    if ((evaluated[pixel >>> 3] & (1 << (pixel & 7))) != 0) {
+                        surfaces[pixel] = correctionDerived.surfaceY[
+                            BaselineGrid.index(pixel & 255, pixel >>> 8)
+                        ];
+                    }
+                }
+            }
+            for (final PatchCodec.Sample sample : correctionPatch.samples()) {
+                if (SurfaceKind.byOrdinal(sample.kind()) == SurfaceKind.UNKNOWN) {
+                    final int pixel = sample.pixelIndex();
+                    surfaces[pixel] = derived.surfaceY[
+                        BaselineGrid.index(pixel & 255, pixel >>> 8)
+                    ];
+                } else {
+                    surfaces[sample.pixelIndex()] = sample.surfaceY();
+                }
+            }
+        }
+        return surfaces;
+    }
+
+    /** Test-support only: a snapshot of currently-queued (not yet in-flight) predicted tile keys. */
+    public synchronized Set<TileKey> pendingKeysForTest() {
+        return new HashSet<>(dirty.keySet());
+    }
+
+    /** Test-support only: whether every queued/in-flight tile has drained. */
+    public synchronized boolean isIdleForTest() {
+        return dirty.isEmpty() && inFlight.isEmpty()
+            && lowerCoverageQueue.isEmpty() && lowerCoverageInFlight.isEmpty();
+    }
+
+    private PixelLookup visiblePixelLookup(
+        final DimensionId dimension,
+        final int lod,
+        final int blockX,
+        final int blockZ
+    ) {
+        return visiblePixelLookup(
+            dimension, PredictionDimensions.layer(dimension), lod, blockX, blockZ
+        );
+    }
+
+    private PixelLookup visiblePixelLookup(
+        final DimensionId dimension,
+        final MapLayer layer,
+        final int lod,
+        final int blockX,
+        final int blockZ
+    ) {
+        final SessionGuard.Session session = sessionGuard.current();
+        if (!session.active() || layer == null
+            || !dimension.equals(session.dimension()) || !state.predictable(dimension)) {
+            return null;
+        }
+        final int tileX = TileMath.blockToTile(blockX, lod);
+        final int tileZ = TileMath.blockToTile(blockZ, lod);
+        final int pixelX = TileMath.blockToPixelInTile(blockX, lod);
+        final int pixelZ = TileMath.blockToPixelInTile(blockZ, lod);
+        final int pixel = pixelZ * TileMath.TILE_SIZE + pixelX;
+        final CorrectionStore store = state.manualSeed() ? null : correctionStore;
+        final CorrectionTile corrections = store == null ? null : store.get(dimension, lod, tileX, tileZ);
+        if (!viewMode.showsPredictedPixels(corrections, pixel, lod)) {
+            return null;
+        }
+        if (!layer.equals(PredictionDimensions.layer(dimension))
+            && !isLowerNetherLayer(dimension, layer)) {
+            return null;
+        }
+        final TileKey metadataKey = new TileKey(
+            session.world(), dimension, layer.cacheId() + PredictedTileKeys.SUFFIX,
+            lod, tileX, tileZ
+        );
+        final TileKey requestKey = isLowerNetherLayer(dimension, layer)
+            ? BiomeTileKeys.toBiome(metadataKey)
+            : metadataKey;
+        return new PixelLookup(metadataKey, requestKey, pixel);
+    }
+
+    private record Composition(
+        TileUpdate update,
+        TileMetadata metadata,
+        byte[] syncEvaluated,
+        long[] syncSourceRevisions,
+        byte[] blockLight,
+        float composedDaylight,
+        float composedGamma,
+        PredictionViewMode mode,
+        boolean hasServerState,
+        long freshnessValidatedAtMillis,
+        long serverCoverageValidatedAtMillis,
+        CorrectionProfile correctionProfile
+    ) {
+    }
+
+    private record TileMetadata(byte[] biomes, int[] surfaces) {
+    }
+
+    private record AppliedLighting(float daylight, float gamma) {
+        private static final AppliedLighting NONE = new AppliedLighting(Float.NaN, 0f);
+    }
+
+    private record PixelLookup(TileKey key, TileKey requestKey, int pixel) {
+    }
+
+    private static TileKey metadataKey(final TileKey key) {
+        final String realLayer = BiomeTileKeys.baseLayerId(key);
+        return new TileKey(
+            key.world(), key.dimension(), realLayer + PredictedTileKeys.SUFFIX,
+            key.lod(), key.tileX(), key.tileZ()
+        );
+    }
+
+    private static boolean isLowerNetherLayer(
+        final DimensionId dimension,
+        final MapLayer layer
+    ) {
+        return dimension.equals(DimensionId.NETHER)
+            && layer.type().isNetherFloor();
+    }
+
+    private static boolean isCurrentNetherBiomeKey(final TileKey key) {
+        if (!key.dimension().equals(DimensionId.NETHER) || !BiomeTileKeys.isBiome(key)) {
+            return false;
+        }
+        try {
+            return MapLayer.parse(BiomeTileKeys.baseLayerId(key)).type()
+                == MapLayer.Type.NETHER_CURRENT;
+        } catch (final IllegalArgumentException e) {
+            return false;
+        }
+    }
+
+    private record ViewportRect(DimensionId dimension, int lod, int minTileX, int maxTileX, int minTileZ, int maxTileZ) {
+        boolean contains(final TileKey key) {
+            if (!dimension.equals(key.dimension()) || lod != key.lod()) {
+                return false;
+            }
+            return key.tileX() >= minTileX && key.tileX() <= maxTileX
+                && key.tileZ() >= minTileZ && key.tileZ() <= maxTileZ;
+        }
+
+        boolean containsPadded(final TileKey key) {
+            if (!dimension.equals(key.dimension()) || lod != key.lod()) {
+                return false;
+            }
+            return key.tileX() >= minTileX - 1 && key.tileX() <= maxTileX + 1
+                && key.tileZ() >= minTileZ - 1 && key.tileZ() <= maxTileZ + 1;
+        }
+    }
+}

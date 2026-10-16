@@ -1,0 +1,970 @@
+package cn.net.rms.confluxmap.core.net;
+
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertIterableEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import cn.net.rms.confluxmap.core.predict.FlatBaseline;
+import cn.net.rms.confluxmap.core.predict.QuadrantLayout;
+import cn.net.rms.confluxmap.core.predict.WorldPreset;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.UUID;
+import org.junit.jupiter.api.Test;
+
+/**
+ * Round-trip, cap-enforcement, and fuzz coverage for {@link MsgCodec}. Every message type is
+ * covered individually, then randomized over a few hundred iterations to exercise edge cases
+ * (empty bodies, boundary lengths, hostile byte sequences).
+ */
+class MsgCodecTest {
+
+    // ---- Per-type round-trip ----
+
+    @Test
+    void helloC2SRoundTrips() throws ProtoException {
+        final HelloC2S original = new HelloC2S("0.2.0", "cb:e61f90580cbd|shim:1|base:1");
+        final HelloC2S decoded = (HelloC2S) MsgCodec.decode(MsgCodec.encode(original));
+        assertEquals(original.modVersion(), decoded.modVersion());
+        assertEquals(original.predictorVersion(), decoded.predictorVersion());
+        assertEquals(Proto.MSG_HELLO_C2S, decoded.typeId());
+    }
+
+    @Test
+    void mapCompatibilityRoundTrips() throws ProtoException {
+        final MapCompatibilityS2C original = new MapCompatibilityS2C(
+            MapSyncCompatibility.NEGOTIATION_VERSION,
+            "0.2.0",
+            Proto.PROTO_MAJOR,
+            Proto.PROTO_MINOR,
+            PatchCodec.FORMAT_VERSION,
+            ChunkPatchCodec.FORMAT_VERSION,
+            "cb:9afc1038ea5a|shim:9|base:14",
+            MapCompatibilityS2C.MODE_RESIDUAL,
+            MapCompatibilityS2C.REASON_NONE
+        );
+
+        final MapCompatibilityS2C decoded = (MapCompatibilityS2C) MsgCodec.decode(
+            MsgCodec.encode(original)
+        );
+
+        assertEquals(original, decoded);
+        assertEquals(Proto.MSG_MAP_COMPATIBILITY_S2C, decoded.typeId());
+    }
+
+    @Test
+    void serverViewDistanceRoundTrips() throws ProtoException {
+        final ServerViewDistanceS2C original = new ServerViewDistanceS2C(12);
+
+        final ServerViewDistanceS2C decoded = (ServerViewDistanceS2C) MsgCodec.decode(
+            MsgCodec.encode(original)
+        );
+
+        assertEquals(12, decoded.chunks());
+        assertEquals(Proto.MSG_SERVER_VIEW_DISTANCE_S2C, decoded.typeId());
+    }
+
+    @Test
+    void serverInstanceRoundTrips() throws ProtoException {
+        final ServerInstanceS2C original =
+            new ServerInstanceS2C("3f2504e0-4f89-11d3-9a0c-0305e82c3301");
+
+        final ServerInstanceS2C decoded = (ServerInstanceS2C) MsgCodec.decode(
+            MsgCodec.encode(original)
+        );
+
+        assertEquals("3f2504e0-4f89-11d3-9a0c-0305e82c3301", decoded.instanceId());
+        assertEquals(Proto.MSG_SERVER_INSTANCE_S2C, decoded.typeId());
+    }
+
+    @Test
+    void playerPositionsRoundTripEveryIdentityAndPositionField() throws ProtoException {
+        final PlayerPositionsS2C original = new PlayerPositionsS2C(List.of(
+            new PlayerPositionsS2C.Entry(
+                UUID.fromString("11111111-2222-3333-4444-555555555555"),
+                "Alex",
+                "minecraft:the_nether",
+                12.25,
+                71.5,
+                -98.75,
+                true
+            )
+        ));
+
+        final PlayerPositionsS2C decoded = (PlayerPositionsS2C) MsgCodec.decode(
+            MsgCodec.encode(original)
+        );
+
+        assertEquals(original, decoded);
+        assertEquals(Proto.MSG_PLAYER_POSITIONS_S2C, decoded.typeId());
+    }
+
+    @Test
+    void playerPositionsRejectNonFiniteCoordinates() {
+        final PlayerPositionsS2C invalid = new PlayerPositionsS2C(List.of(
+            new PlayerPositionsS2C.Entry(
+                UUID.randomUUID(),
+                "Alex",
+                "minecraft:overworld",
+                Double.NaN,
+                64.0,
+                0.0,
+                false
+            )
+        ));
+
+        assertThrows(ProtoException.class, () -> MsgCodec.encode(invalid));
+    }
+
+    @Test
+    void mapCompatibilityRejectsUnknownSelections() {
+        final MapCompatibilityS2C invalid = new MapCompatibilityS2C(
+            MapSyncCompatibility.NEGOTIATION_VERSION,
+            "0.2.0",
+            Proto.PROTO_MAJOR,
+            Proto.PROTO_MINOR,
+            PatchCodec.FORMAT_VERSION,
+            ChunkPatchCodec.FORMAT_VERSION,
+            MapSyncCompatibility.STABLE_PREDICTOR,
+            255,
+            MapCompatibilityS2C.REASON_NONE
+        );
+
+        assertThrows(ProtoException.class, () -> MsgCodec.encode(invalid));
+    }
+
+    @Test
+    void mapCapabilitiesRoundTripsAndRejectsDuplicateIds() throws ProtoException {
+        final MapCapabilitiesS2C original = new MapCapabilitiesS2C(
+            MapSyncProtocol.NEGOTIATION_VERSION,
+            "0.2.0",
+            MapSyncCompatibility.STABLE_PREDICTOR,
+            MapCompatibilityS2C.MODE_RESIDUAL,
+            MapCompatibilityS2C.REASON_NONE,
+            CorrectionProfile.SOURCE_LIGHT_V2.id(),
+            List.of(
+                new MapCapabilitiesS2C.Entry(MapSyncCapability.LOAD_STATE.id(), 1),
+                new MapCapabilitiesS2C.Entry(MapSyncCapability.REGION_CORRECTION.id(), 1)
+            )
+        );
+
+        assertEquals(original, MsgCodec.decode(MsgCodec.encode(original)));
+
+        final MapCapabilitiesS2C duplicate = new MapCapabilitiesS2C(
+            original.negotiationVersion(), original.serverModVersion(),
+            original.serverPredictorVersion(), original.correctionMode(),
+            original.reasonCode(), original.correctionProfileId(),
+            List.of(
+                new MapCapabilitiesS2C.Entry(1, 1),
+                new MapCapabilitiesS2C.Entry(1, 1)
+            )
+        );
+        assertThrows(ProtoException.class, () -> MsgCodec.encode(duplicate));
+    }
+
+    @Test
+    void helloPolicyRoundTripsWithSeed() throws ProtoException {
+        final HelloPolicyS2C original = new HelloPolicyS2C(
+            new HelloPolicyS2C.Flags(true, true, true, true, true, true, true, true),
+            "11111111-2222-3333-4444-555555555555",
+            "1.17",
+            new HelloPolicyS2C.Budgets(65_536, 8, 300, 2),
+            List.of(
+                new HelloPolicyS2C.DimDescriptor("minecraft:overworld", "overworld", true, true, -4587293450L, WorldPreset.LARGE_BIOMES),
+                new HelloPolicyS2C.DimDescriptor("minecraft:the_end", "the_end", true, true, -4587293450L, WorldPreset.DEFAULT)
+            )
+        );
+        final HelloPolicyS2C decoded = (HelloPolicyS2C) MsgCodec.decode(MsgCodec.encode(original));
+        assertEquals(original.flags(), decoded.flags());
+        assertEquals(original.worldId(), decoded.worldId());
+        assertEquals(original.worldgenVersion(), decoded.worldgenVersion());
+        assertEquals(original.budgets(), decoded.budgets());
+        assertIterableEquals(original.dims(), decoded.dims());
+        assertEquals(Proto.MSG_HELLO_POLICY_S2C, decoded.typeId());
+        assertTrue(decoded.flags().chunkLoadStateEnabled());
+        assertTrue(decoded.flags().entityRadarForbidden());
+        assertTrue(decoded.flags().correctionInvalidationEnabled());
+        assertTrue(decoded.flags().chunkRangeCorrectionEnabled());
+        assertTrue(decoded.flags().biomeMapForbidden());
+        assertTrue(decoded.flags().structureSearchForbidden());
+    }
+
+    @Test
+    void helloPolicyRoundTripsWithoutSeed() throws ProtoException {
+        final HelloPolicyS2C original = new HelloPolicyS2C(
+            new HelloPolicyS2C.Flags(false, true, false, false),
+            "deadbeef-0000-0000-0000-000000000000",
+            "1.17",
+            new HelloPolicyS2C.Budgets(32_768, 4, 500, 1),
+            List.of(
+                new HelloPolicyS2C.DimDescriptor("minecraft:overworld", "overworld", true, false, 0L, WorldPreset.DEFAULT)
+            )
+        );
+        final HelloPolicyS2C decoded = (HelloPolicyS2C) MsgCodec.decode(MsgCodec.encode(original));
+        assertEquals(original.flags(), decoded.flags());
+        assertEquals(original.worldId(), decoded.worldId());
+        assertEquals(1, decoded.dims().size());
+        assertEquals(original.dims().get(0), decoded.dims().get(0));
+    }
+
+    @Test
+    void helloPolicyCarriesPerDimGeneratorPresets() throws ProtoException {
+        final HelloPolicyS2C original = new HelloPolicyS2C(
+            new HelloPolicyS2C.Flags(true, true, false, false),
+            "11111111-2222-3333-4444-555555555555",
+            "1.17",
+            new HelloPolicyS2C.Budgets(65_536, 8, 300, 2),
+            List.of(
+                // Superflat overworld: preset carried in the spare dim-flag bits, predictable off.
+                new HelloPolicyS2C.DimDescriptor("minecraft:overworld", "overworld", false, true, 42L, WorldPreset.FLAT),
+                new HelloPolicyS2C.DimDescriptor("minecraft:the_end", "the_end", true, true, 42L, WorldPreset.AMPLIFIED)
+            )
+        );
+        final HelloPolicyS2C decoded = (HelloPolicyS2C) MsgCodec.decode(MsgCodec.encode(original));
+        assertEquals(WorldPreset.FLAT, decoded.dims().get(0).preset());
+        assertFalse(decoded.dims().get(0).predictable());
+        assertEquals(WorldPreset.AMPLIFIED, decoded.dims().get(1).preset());
+        assertIterableEquals(original.dims(), decoded.dims());
+    }
+
+    @Test
+    void flatBaselineRoundTrips() throws ProtoException {
+        final FlatBaselineS2C original = new FlatBaselineS2C(List.of(
+            new FlatBaselineS2C.Entry(0, new FlatBaseline(1, 3, 1, 11, 0)),
+            new FlatBaselineS2C.Entry(2, new FlatBaseline(7, 63, 2, 12, 40, "minecraft:white_stained_glass"))
+        ));
+        final FlatBaselineS2C decoded = (FlatBaselineS2C) MsgCodec.decode(MsgCodec.encode(original));
+        assertIterableEquals(original.entries(), decoded.entries());
+        assertEquals(Proto.MSG_FLAT_BASELINE_S2C, decoded.typeId());
+    }
+
+    @Test
+    void flatBaselineLegacyShapeOmitsTheTopMaterial() throws ProtoException {
+        final FlatBaselineS2C original = new FlatBaselineS2C(List.of(
+            new FlatBaselineS2C.Entry(0, new FlatBaseline(1, 3, 1, 11, 0, "minecraft:glass"))
+        ));
+        final Map<MapSyncCapability, Integer> legacy = Map.of(MapSyncCapability.FLAT_BASELINE, 1);
+
+        final byte[] payload = MsgCodec.encode(original, legacy);
+        final FlatBaselineS2C decoded = (FlatBaselineS2C) MsgCodec.decode(payload, legacy);
+
+        assertEquals("", decoded.entries().get(0).baseline().topMaterialId());
+        // The version 2 shape decodes the same bytes only with the material appended, so a v1
+        // payload must fail the trailing-bytes check rather than misparse.
+        assertThrows(ProtoException.class, () -> MsgCodec.decode(payload));
+    }
+
+    @Test
+    void quadraLayoutRoundTrips() throws ProtoException {
+        final QuadrantLayout layout = new QuadrantLayout(
+            QuadrantLayout.Style.FLAT, new FlatBaseline(1, -60, 1, 2, 0, "minecraft:white_stained_glass"),
+            QuadrantLayout.Style.CLEARED, null,
+            QuadrantLayout.Style.FLAT, new FlatBaseline(47, 0, 9, 255, 0),
+            QuadrantLayout.Style.NOISE, null
+        );
+        final QuadraLayoutS2C original = new QuadraLayoutS2C(List.of(
+            new QuadraLayoutS2C.Entry(0, layout)
+        ));
+
+        final QuadraLayoutS2C decoded = (QuadraLayoutS2C) MsgCodec.decode(MsgCodec.encode(original));
+
+        assertEquals(Proto.MSG_QUADRA_LAYOUT_S2C, decoded.typeId());
+        assertEquals(1, decoded.entries().size());
+        final QuadrantLayout decodedLayout = decoded.entries().get(0).layout();
+        for (int quadrant = 0; quadrant < 4; quadrant++) {
+            assertEquals(layout.style(quadrant), decodedLayout.style(quadrant));
+            assertEquals(layout.flat(quadrant), decodedLayout.flat(quadrant));
+        }
+        assertEquals(layout.predictsTerrainAt(-1, -1), decodedLayout.predictsTerrainAt(-1, -1));
+    }
+
+    @Test
+    void quadraLayoutLegacyShapeOmitsTheTopMaterial() throws ProtoException {
+        final QuadrantLayout layout = new QuadrantLayout(
+            QuadrantLayout.Style.FLAT, new FlatBaseline(1, -60, 1, 2, 0, "minecraft:white_stained_glass"),
+            QuadrantLayout.Style.NOISE, null,
+            QuadrantLayout.Style.NOISE, null,
+            QuadrantLayout.Style.NOISE, null
+        );
+        final QuadraLayoutS2C original = new QuadraLayoutS2C(List.of(
+            new QuadraLayoutS2C.Entry(0, layout)
+        ));
+        final Map<MapSyncCapability, Integer> legacy = Map.of(MapSyncCapability.QUADRA_LAYOUT, 1);
+
+        final byte[] payload = MsgCodec.encode(original, legacy);
+        final QuadraLayoutS2C decoded = (QuadraLayoutS2C) MsgCodec.decode(payload, legacy);
+
+        assertEquals("", decoded.entries().get(0).layout().flat(0).topMaterialId());
+        assertThrows(ProtoException.class, () -> MsgCodec.decode(payload));
+    }
+
+    @Test
+    void quadraLayoutRejectsUnknownStyles() {
+        final byte[] framed = new byte[] {
+            (byte) Proto.MSG_QUADRA_LAYOUT_S2C,
+            1,      // entries
+            0,      // dimIndex
+            9, 1, 0, 0 // hostile style ordinal
+        };
+        assertThrows(ProtoException.class, () -> MsgCodec.decode(framed));
+    }
+
+    @Test
+    void loadStateSubscriptionRoundTrips() throws ProtoException {
+        final LoadStateSubscribeC2S original = new LoadStateSubscribeC2S(
+            42, 1, true, -100, -75, 200, 125
+        );
+
+        final LoadStateSubscribeC2S decoded = (LoadStateSubscribeC2S) MsgCodec.decode(
+            MsgCodec.encode(original)
+        );
+
+        assertEquals(original, decoded);
+        assertEquals(Proto.MSG_LOAD_STATE_SUBSCRIBE_C2S, decoded.typeId());
+    }
+
+    @Test
+    void loadStateDeltaRoundTrips() throws ProtoException {
+        final LoadStateDeltaS2C original = new LoadStateDeltaS2C(
+            42,
+            true,
+            false,
+            List.of(
+                new LoadStateDeltaS2C.Entry(-7, 9, 31, ChunkLoadBand.ENTITY_TICKING),
+                new LoadStateDeltaS2C.Entry(10, -11, 32, ChunkLoadBand.BLOCK_TICKING),
+                new LoadStateDeltaS2C.Entry(12, 13, 33, ChunkLoadBand.BORDER),
+                new LoadStateDeltaS2C.Entry(14, 15, Proto.LOAD_STATE_UNLOADED_LEVEL, ChunkLoadBand.UNLOADED)
+            )
+        );
+
+        final LoadStateDeltaS2C decoded = (LoadStateDeltaS2C) MsgCodec.decode(
+            MsgCodec.encode(original)
+        );
+
+        assertEquals(original, decoded);
+        assertEquals(Proto.MSG_LOAD_STATE_DELTA_S2C, decoded.typeId());
+    }
+
+    @Test
+    void mapInvalidationMessagesRoundTrip() throws ProtoException {
+        final MapSyncSubscribeC2S subscription = new MapSyncSubscribeC2S(
+            1, 3, true, -4, 5, -6, 7
+        );
+        assertEquals(subscription, MsgCodec.decode(MsgCodec.encode(subscription)));
+
+        final MapInvalidateS2C invalidation = new MapInvalidateS2C(
+            1, 3, List.of(
+                new MapInvalidateS2C.Tile(-4, 6),
+                new MapInvalidateS2C.Tile(5, -6)
+            )
+        );
+        assertEquals(invalidation, MsgCodec.decode(MsgCodec.encode(invalidation)));
+    }
+
+    @Test
+    void mapInvalidationMessagesEnforceBounds() {
+        assertThrows(ProtoException.class, () -> MsgCodec.encode(new MapSyncSubscribeC2S(
+            0, 0, true, 0, Proto.MAX_MAP_SYNC_VIEW_TILES, 0, 0
+        )));
+        assertThrows(ProtoException.class, () -> MsgCodec.encode(new MapSyncSubscribeC2S(
+            0, 0, true, Integer.MIN_VALUE, Integer.MAX_VALUE, Integer.MIN_VALUE, Integer.MAX_VALUE
+        )));
+        assertThrows(ProtoException.class, () -> MsgCodec.encode(new MapInvalidateS2C(
+            0, 0, List.of()
+        )));
+    }
+
+    @Test
+    void loadStateMessagesEnforceViewportEntryAndSentinelBounds() {
+        assertThrows(ProtoException.class, () -> MsgCodec.encode(new LoadStateSubscribeC2S(
+            1, 0, true, 0, 0, Proto.MAX_LOAD_STATE_SPAN, 0
+        )));
+
+        final List<LoadStateDeltaS2C.Entry> tooMany = new ArrayList<>();
+        for (int i = 0; i <= Proto.MAX_LOAD_STATE_ENTRIES; i++) {
+            tooMany.add(new LoadStateDeltaS2C.Entry(i, 0, 33, ChunkLoadBand.BORDER));
+        }
+        assertThrows(ProtoException.class, () -> MsgCodec.encode(
+            new LoadStateDeltaS2C(1, true, false, tooMany)
+        ));
+        assertThrows(ProtoException.class, () -> MsgCodec.encode(new LoadStateDeltaS2C(
+            1,
+            false,
+            false,
+            List.of(new LoadStateDeltaS2C.Entry(0, 0, 31, ChunkLoadBand.UNLOADED))
+        )));
+        assertThrows(ProtoException.class, () -> MsgCodec.encode(new LoadStateDeltaS2C(
+            1,
+            false,
+            false,
+            List.of(new LoadStateDeltaS2C.Entry(0, 0, 32, ChunkLoadBand.ENTITY_TICKING))
+        )));
+    }
+
+    @Test
+    void flatBaselineRejectsEmptyAndOversizedEntryLists() {
+        assertThrows(ProtoException.class, () -> MsgCodec.encode(new FlatBaselineS2C(List.of())));
+        final List<FlatBaselineS2C.Entry> tooMany = new ArrayList<>();
+        for (int i = 0; i <= Proto.MAX_DIM_ENTRIES; i++) {
+            tooMany.add(new FlatBaselineS2C.Entry(i, new FlatBaseline(1, 3, 1, 11, 0)));
+        }
+        assertThrows(ProtoException.class, () -> MsgCodec.encode(new FlatBaselineS2C(tooMany)));
+    }
+
+    @Test
+    void mapViewReqRoundTrips() throws ProtoException {
+        final MapViewReqC2S original = new MapViewReqC2S(
+            0x12345678,
+            1,
+            2,
+            List.of(
+                new MapViewReqC2S.TileReq(-1, -2, 0L),
+                new MapViewReqC2S.TileReq(100, -100, 1_700_000_000L),
+                new MapViewReqC2S.TileReq(Integer.MAX_VALUE, Integer.MIN_VALUE, Long.MAX_VALUE)
+            )
+        );
+        final MapViewReqC2S decoded = (MapViewReqC2S) MsgCodec.decode(MsgCodec.encode(original));
+        assertEquals(original.reqId(), decoded.reqId());
+        assertEquals(original.dimIndex(), decoded.dimIndex());
+        assertEquals(original.lod(), decoded.lod());
+        assertIterableEquals(original.tiles(), decoded.tiles());
+        assertEquals(Proto.MSG_MAP_VIEW_REQ_C2S, decoded.typeId());
+    }
+
+    @Test
+    void mapPatchStubRoundTripsOpaqueBody() throws ProtoException {
+        final byte[] presence = new byte[Proto.PATCH_PRESENCE_BYTES];
+        for (int i = 0; i < presence.length; i++) {
+            presence[i] = (byte) (i * 7 + 3);
+        }
+        final byte[] body = new byte[] {1, 2, 3, 0x7F, -128, 0, 0, 'X', 'Y', 'Z'};
+        final MapPatchS2C original = new MapPatchS2C(
+            42, 0, 1, -5, 7, Proto.PATCH_MODE_RESIDUAL, 123_456_789L, presence, body
+        );
+        final MapPatchS2C decoded = (MapPatchS2C) MsgCodec.decode(MsgCodec.encode(original));
+        assertEquals(original.reqId(), decoded.reqId());
+        assertEquals(original.dimIndex(), decoded.dimIndex());
+        assertEquals(original.lod(), decoded.lod());
+        assertEquals(original.tileX(), decoded.tileX());
+        assertEquals(original.tileZ(), decoded.tileZ());
+        assertEquals(original.mode(), decoded.mode());
+        assertEquals(original.tileRevision(), decoded.tileRevision());
+        assertArrayEquals(original.presence(), decoded.presence());
+        assertArrayEquals(original.body(), decoded.body());
+        assertEquals(Proto.MSG_MAP_PATCH_S2C, decoded.typeId());
+    }
+
+    @Test
+    void mapPatchWithEmptyBodyRoundTrips() throws ProtoException {
+        final byte[] presence = new byte[Proto.PATCH_PRESENCE_BYTES];
+        final MapPatchS2C original = new MapPatchS2C(
+            0, 0, 0, 0, 0, Proto.PATCH_MODE_UNAVAILABLE, 0L, presence, new byte[0]
+        );
+        final MapPatchS2C decoded = (MapPatchS2C) MsgCodec.decode(MsgCodec.encode(original));
+        assertEquals(0, decoded.body().length);
+    }
+
+    @Test
+    void progressiveMapPatchRoundTripsAValidEmptyPatchBody() throws ProtoException {
+        final byte[] body = PatchCodec.encode(List.of());
+        final MapPatchS2C original = new MapPatchS2C(
+            9, 0, 4, -2, 3, Proto.PATCH_MODE_PARTIAL, 0L,
+            new byte[Proto.PATCH_PRESENCE_BYTES], body
+        );
+
+        final MapPatchS2C decoded = (MapPatchS2C) MsgCodec.decode(MsgCodec.encode(original));
+
+        assertEquals(Proto.PATCH_MODE_PARTIAL, decoded.mode());
+        assertEquals(0L, decoded.tileRevision());
+        assertEquals(0, PatchCodec.decode(decoded.body()).size());
+    }
+
+    @Test
+    void regionPageRequestAndPatchRoundTrip() throws ProtoException {
+        final MapRegionViewReqC2S request = new MapRegionViewReqC2S(
+            41, 0, 4, List.of(
+                new MapRegionViewReqC2S.RegionReq(-2, 3, 14, 1, 15, 12, Long.MIN_VALUE),
+                new MapRegionViewReqC2S.RegionReq(-1, 3, 0, 1, 15, 12, 91L)
+            )
+        );
+        final byte[] generated = {(byte) 0xFF, (byte) 0xFF, (byte) 0xFF};
+        final byte[] evaluated = {(byte) 0xFF, (byte) 0xFF, (byte) 0xFF};
+        final byte[] body = ChunkPatchCodec.encode(new ChunkPatchCodec.Patch(
+            2, 12, 1, generated, evaluated, List.of(
+                new PatchCodec.Sample(0, 1, 80, 1, 1, 0)
+            )
+        ));
+        final MapRegionPatchS2C patch = new MapRegionPatchS2C(
+            41, 0, 4, -2, 3, 14, 1, 15, 12,
+            Proto.PATCH_MODE_RESIDUAL, 123L, body
+        );
+
+        assertEquals(request, MsgCodec.decode(MsgCodec.encode(request)));
+        final MapRegionPatchS2C decoded = (MapRegionPatchS2C) MsgCodec.decode(MsgCodec.encode(patch));
+        assertEquals(patch.reqId(), decoded.reqId());
+        assertEquals(patch.slice(), decoded.slice());
+        assertEquals(patch.regionRevision(), decoded.regionRevision());
+        assertArrayEquals(patch.body(), decoded.body());
+    }
+
+    @Test
+    void regionSubscriptionAndInvalidationRoundTrip() throws ProtoException {
+        final MapRegionSyncSubscribeC2S subscription = new MapRegionSyncSubscribeC2S(
+            0, 4, true, -120, 300, -75, 90
+        );
+        final MapRegionInvalidateS2C invalidation = new MapRegionInvalidateS2C(
+            0, 4, List.of(
+                new MapRegionInvalidateS2C.Region(-8, 2),
+                new MapRegionInvalidateS2C.Region(-7, 2)
+            )
+        );
+
+        assertEquals(subscription, MsgCodec.decode(MsgCodec.encode(subscription)));
+        assertEquals(invalidation, MsgCodec.decode(MsgCodec.encode(invalidation)));
+    }
+
+    @Test
+    void regionMessagesRejectInvalidHeadersAndPatchModes() {
+        assertThrows(ProtoException.class, () -> MsgCodec.encode(new MapRegionViewReqC2S(
+            1, Proto.MAX_DIM_ENTRIES, 0,
+            List.of(new MapRegionViewReqC2S.RegionReq(0, 0, 0, 0, 0, 0, Long.MIN_VALUE))
+        )));
+        assertThrows(ProtoException.class, () -> MsgCodec.encode(new MapRegionPatchS2C(
+            1, 0, 4, 0, 0, 0, 0, 0, 0,
+            Proto.PATCH_MODE_PARTIAL, 0L, new byte[0]
+        )));
+        assertThrows(ProtoException.class, () -> MsgCodec.encode(new MapRegionPatchS2C(
+            1, 0, 4, 0, 0, 0, 0, 0, 0,
+            Proto.PATCH_MODE_UNCHANGED, 0L, new byte[] {1}
+        )));
+    }
+
+    @Test
+    void regionPageDecoderRejectsAnOutOfRangeDimension() throws ProtoException {
+        final byte[] payload = MsgCodec.encode(new MapRegionViewReqC2S(
+            1, 0, 4,
+            List.of(new MapRegionViewReqC2S.RegionReq(0, 0, 0, 0, 0, 0, Long.MIN_VALUE))
+        ));
+        payload[5] = (byte) Proto.MAX_DIM_ENTRIES;
+
+        assertThrows(ProtoException.class, () -> MsgCodec.decode(payload));
+    }
+
+    @Test
+    void policyUpdateRoundTrips() throws ProtoException {
+        final PolicyUpdateS2C original = new PolicyUpdateS2C(
+            new HelloPolicyS2C.Flags(
+                false, true, true, false, true, false, false, true
+            ),
+            new HelloPolicyS2C.Budgets(8_192, 2, 1_000, 0)
+        );
+        final PolicyUpdateS2C decoded = (PolicyUpdateS2C) MsgCodec.decode(MsgCodec.encode(original));
+        assertEquals(original.flags(), decoded.flags());
+        assertEquals(original.budgets(), decoded.budgets());
+        assertEquals(Proto.MSG_POLICY_UPDATE_S2C, decoded.typeId());
+        assertTrue(decoded.flags().entityRadarForbidden());
+        assertTrue(decoded.flags().biomeMapForbidden());
+        assertTrue(decoded.flags().structureSearchForbidden());
+    }
+
+    @Test
+    void absentNegativePolicyBitsPreserveHistoricalAllowedBehavior() throws ProtoException {
+        final HelloPolicyS2C original = new HelloPolicyS2C(
+            new HelloPolicyS2C.Flags(false, true, false, false),
+            "deadbeef-0000-0000-0000-000000000000",
+            "1.17",
+            new HelloPolicyS2C.Budgets(32_768, 4, 500, 1),
+            List.of()
+        );
+
+        final HelloPolicyS2C decoded = (HelloPolicyS2C) MsgCodec.decode(MsgCodec.encode(original));
+
+        assertFalse(decoded.flags().entityRadarForbidden());
+        assertFalse(decoded.flags().biomeMapForbidden());
+        assertFalse(decoded.flags().structureSearchForbidden());
+    }
+
+    @Test
+    void errorRoundTrips() throws ProtoException {
+        final ErrorS2C original = new ErrorS2C(ErrorS2C.ERR_RATE_LIMITED, "slow down");
+        final ErrorS2C decoded = (ErrorS2C) MsgCodec.decode(MsgCodec.encode(original));
+        assertEquals(original.code(), decoded.code());
+        assertEquals(original.detail(), decoded.detail());
+        assertEquals(Proto.MSG_ERROR_S2C, decoded.typeId());
+    }
+
+    // ---- Cap enforcement ----
+
+    @Test
+    void encodeRejectsTooLongUtf8() {
+        final byte[] raw = new byte[Proto.MAX_UTF8_BYTES + 1];
+        Arrays.fill(raw, (byte) 'A');
+        final String tooLong = new String(raw, StandardCharsets.UTF_8);
+        final HelloC2S msg = new HelloC2S(tooLong, "ok");
+        assertThrows(ProtoException.class, () -> MsgCodec.encode(msg));
+    }
+
+    @Test
+    void encodeRejectsPatchBodyAboveCompressedCap() {
+        final MapPatchS2C msg = new MapPatchS2C(
+            1, 0, 0, 0, 0, Proto.PATCH_MODE_ABSOLUTE, 1L,
+            new byte[Proto.PATCH_PRESENCE_BYTES], new byte[PatchCodec.MAX_COMPRESSED_BYTES + 1]
+        );
+        assertThrows(ProtoException.class, () -> MsgCodec.encode(msg));
+    }
+
+    @Test
+    void decodeRejectsTooLongUtf8() throws ProtoException {
+        // Encode a valid hello, then patch the u16 length prefix of the first utf field
+        // to exceed MAX_UTF8_BYTES so the decoder refuses it.
+        final byte[] payload = MsgCodec.encode(new HelloC2S("ok", "ok"));
+        payload[1] = (byte) ((Proto.MAX_UTF8_BYTES + 1) >>> 8);
+        payload[2] = (byte) ((Proto.MAX_UTF8_BYTES + 1) & 0xFF);
+        assertThrows(ProtoException.class, () -> MsgCodec.decode(payload));
+    }
+
+    @Test
+    void decodeRejectsTruncatedPayload() throws ProtoException {
+        final byte[] payload = MsgCodec.encode(new HelloC2S("hello", "world"));
+        // Truncate mid-string: keep type byte and the u16 length, drop all utf bytes.
+        final byte[] truncated = Arrays.copyOf(payload, 3);
+        assertThrows(ProtoException.class, () -> MsgCodec.decode(truncated));
+    }
+
+    @Test
+    void decodeRejectsTrailingBytesAfterACompleteMessage() throws ProtoException {
+        final byte[] encoded = MsgCodec.encode(new HelloC2S("hello", "world"));
+        final byte[] payload = Arrays.copyOf(encoded, encoded.length + 1);
+        payload[payload.length - 1] = 0x55;
+
+        assertThrows(ProtoException.class, () -> MsgCodec.decode(payload));
+    }
+
+    @Test
+    void decodeRejectsMalformedUtf8() {
+        final byte[] payload = new byte[] {
+            (byte) Proto.MSG_HELLO_C2S,
+            0, 1, (byte) 0xC3,
+            0, 0
+        };
+
+        assertThrows(ProtoException.class, () -> MsgCodec.decode(payload));
+    }
+
+    @Test
+    void decodeRejectsUnknownTypeByte() {
+        // Type byte 0x00 is outside MSG_MIN..MSG_MAX; payload is otherwise irrelevant.
+        final byte[] payload = new byte[] {0x00, 'x', 'y'};
+        assertThrows(ProtoException.class, () -> MsgCodec.decode(payload));
+    }
+
+    @Test
+    void decodeRejectsEmptyPayload() {
+        assertThrows(ProtoException.class, () -> MsgCodec.decode(new byte[0]));
+    }
+
+    @Test
+    void encodeRejectsTooManyTiles() {
+        final MapViewReqC2S.TileReq[] tiles = new MapViewReqC2S.TileReq[Proto.MAX_TILES_PER_REQ + 1];
+        Arrays.fill(tiles, new MapViewReqC2S.TileReq(0, 0, 0L));
+        final MapViewReqC2S msg = new MapViewReqC2S(1, 0, 0, Arrays.asList(tiles));
+        assertThrows(ProtoException.class, () -> MsgCodec.encode(msg));
+    }
+
+    @Test
+    void encodeRejectsTooManyDims() {
+        final HelloPolicyS2C.DimDescriptor[] dims = new HelloPolicyS2C.DimDescriptor[Proto.MAX_DIM_ENTRIES + 1];
+        Arrays.fill(dims, new HelloPolicyS2C.DimDescriptor("minecraft:overworld", "overworld", true, true, 0L, WorldPreset.DEFAULT));
+        final HelloPolicyS2C msg = new HelloPolicyS2C(
+            new HelloPolicyS2C.Flags(false, false, false, false),
+            "id", "1.17",
+            new HelloPolicyS2C.Budgets(1, 1, 1, 1),
+            Arrays.asList(dims)
+        );
+        assertThrows(ProtoException.class, () -> MsgCodec.encode(msg));
+    }
+
+    @Test
+    void encodeRejectsWrongPresenceLength() {
+        final MapPatchS2C msg = new MapPatchS2C(
+            0, 0, 0, 0, 0, Proto.PATCH_MODE_UNCHANGED, 0L,
+            new byte[Proto.PATCH_PRESENCE_BYTES - 1], new byte[0]
+        );
+        assertThrows(ProtoException.class, () -> MsgCodec.encode(msg));
+    }
+
+    @Test
+    void decodeRejectsTooManyTiles() throws ProtoException {
+        // Build a MAP_VIEW_REQ by hand with a tile count above the cap.
+        final byte[] payload = MsgCodec.encode(new MapViewReqC2S(0, 0, 0, List.of()));
+        // Patch the tile count byte (offset 1+4+1+1=7: type + reqId + dimIndex + lod).
+        payload[7] = (byte) (Proto.MAX_TILES_PER_REQ + 1);
+        assertThrows(ProtoException.class, () -> MsgCodec.decode(payload));
+    }
+
+    // ---- Fuzz ----
+
+    @Test
+    void fuzzRoundTripsEveryTypeHundredsOfIterations() throws ProtoException {
+        final Random rng = new Random(20260718L);
+        for (int i = 0; i < 500; i++) {
+            final Message original = randomMessage(rng);
+            final byte[] encoded = MsgCodec.encode(original);
+            final Message decoded = MsgCodec.decode(encoded);
+            assertMessagesEqual(original, decoded, "iteration " + i + " failed for " + original.getClass().getSimpleName());
+        }
+    }
+
+    @Test
+    void fuzzRandomGarbageDoesNotCrashOrCorrupt() {
+        final Random rng = new Random(424242L);
+        int valid = 0;
+        int rejected = 0;
+        for (int i = 0; i < 2_000; i++) {
+            final int len = rng.nextInt(64);
+            final byte[] garbage = new byte[len];
+            rng.nextBytes(garbage);
+            try {
+                final Message m = MsgCodec.decode(garbage);
+                // If it decoded, it must re-encode without exception and to the same bytes.
+                final byte[] reEncoded = MsgCodec.encode(m);
+                final Message m2 = MsgCodec.decode(reEncoded);
+                assertMessagesEqual(m, m2, "garbage iteration " + i);
+                valid++;
+            } catch (final ProtoException | NegativeArraySizeException | OutOfMemoryError e) {
+                // NegativeArraySizeException / OOM must NEVER leak from a hostile payload; the
+                // test's job here is to surface them. ProtoException is the expected rejection.
+                if (e instanceof ProtoException) {
+                    rejected++;
+                } else {
+                    throw new AssertionError("iteration " + i + " leaked " + e.getClass().getSimpleName()
+                        + " for payload " + Arrays.toString(garbage), e);
+                }
+            }
+        }
+        assertEquals(2_000, valid + rejected, "every hostile payload must either decode exactly or be rejected");
+        assertTrue(rejected > 0, "fuzz produced no rejections (seed: 424242)");
+    }
+
+    /**
+     * Records auto-generate {@code equals} using reference-equality for {@code byte[]} fields, so
+     * {@link MapPatchS2C} needs field-by-field comparison via {@link Assertions#assertArrayEquals}.
+     * Every other message type is composed of primitives and strings, whose record-generated
+     * {@code equals} is correct as-is.
+     */
+    private static void assertMessagesEqual(final Message expected, final Message actual, final String msg) {
+        if (expected instanceof final MapPatchS2C e && actual instanceof final MapPatchS2C a) {
+            assertEquals(e.reqId(), a.reqId(), msg);
+            assertEquals(e.dimIndex(), a.dimIndex(), msg);
+            assertEquals(e.lod(), a.lod(), msg);
+            assertEquals(e.tileX(), a.tileX(), msg);
+            assertEquals(e.tileZ(), a.tileZ(), msg);
+            assertEquals(e.mode(), a.mode(), msg);
+            assertEquals(e.tileRevision(), a.tileRevision(), msg);
+            assertArrayEquals(e.presence(), a.presence(), msg);
+            assertArrayEquals(e.body(), a.body(), msg);
+        } else {
+            assertEquals(expected, actual, msg);
+        }
+    }
+
+    private static Message randomMessage(final Random rng) {
+        switch (rng.nextInt(8)) {
+            case 0:
+                return new HelloC2S(randomUtf8(rng, 8), randomUtf8(rng, 12));
+            case 1:
+                return new HelloPolicyS2C(
+                    new HelloPolicyS2C.Flags(
+                        rng.nextBoolean(), rng.nextBoolean(), rng.nextBoolean(), rng.nextBoolean(),
+                        rng.nextBoolean(), rng.nextBoolean()
+                    ),
+                    randomUuidString(rng), "1.17",
+                    new HelloPolicyS2C.Budgets(rng.nextInt(1 << 16), rng.nextInt(16) + 1, rng.nextInt(5_000), rng.nextInt(5)),
+                    randomDims(rng)
+                );
+            case 2:
+                return new MapViewReqC2S(rng.nextInt(), rng.nextInt(4), rng.nextInt(5), randomTiles(rng));
+            case 3: {
+                final byte[] presence = new byte[Proto.PATCH_PRESENCE_BYTES];
+                rng.nextBytes(presence);
+                final int bodyLen = rng.nextInt(32);
+                final byte[] body = new byte[bodyLen];
+                rng.nextBytes(body);
+                return new MapPatchS2C(
+                    rng.nextInt(), rng.nextInt(4), rng.nextInt(5), rng.nextInt(), rng.nextInt(),
+                    rng.nextInt(4), rng.nextLong(), presence, body
+                );
+            }
+            case 4:
+                return new PolicyUpdateS2C(
+                    new HelloPolicyS2C.Flags(
+                        rng.nextBoolean(), rng.nextBoolean(), rng.nextBoolean(), rng.nextBoolean(),
+                        rng.nextBoolean(), rng.nextBoolean()
+                    ),
+                    new HelloPolicyS2C.Budgets(rng.nextInt(1 << 16), rng.nextInt(16) + 1, rng.nextInt(5_000), rng.nextInt(5))
+                );
+            case 5:
+                return new ErrorS2C(rng.nextInt(5), randomUtf8(rng, 16));
+            case 6: {
+                final int minX = rng.nextInt(2_000_001) - 1_000_000;
+                final int minZ = rng.nextInt(2_000_001) - 1_000_000;
+                return new MapSyncSubscribeC2S(
+                    rng.nextInt(Proto.MAX_DIM_ENTRIES), rng.nextInt(5), true,
+                    minX, minX + rng.nextInt(4), minZ, minZ + rng.nextInt(4)
+                );
+            }
+            default:
+                return new MapInvalidateS2C(
+                    rng.nextInt(Proto.MAX_DIM_ENTRIES), rng.nextInt(5),
+                    List.of(new MapInvalidateS2C.Tile(rng.nextInt(), rng.nextInt()))
+                );
+        }
+    }
+
+    private static List<MapViewReqC2S.TileReq> randomTiles(final Random rng) {
+        final int n = rng.nextInt(Proto.MAX_TILES_PER_REQ) + 1;
+        final MapViewReqC2S.TileReq[] tiles = new MapViewReqC2S.TileReq[n];
+        for (int i = 0; i < n; i++) {
+            tiles[i] = new MapViewReqC2S.TileReq(rng.nextInt(), rng.nextInt(), rng.nextLong());
+        }
+        return Arrays.asList(tiles);
+    }
+
+
+    @Test
+    void biomeLangRoundTrips() throws ProtoException {
+        final BiomeLangReqC2S request = new BiomeLangReqC2S("zh_cn");
+        final BiomeLangReqC2S decodedRequest =
+            (BiomeLangReqC2S) MsgCodec.decode(MsgCodec.encode(request));
+        assertEquals(Proto.MSG_BIOME_LANG_REQ_C2S, decodedRequest.typeId());
+        assertEquals("zh_cn", decodedRequest.locale());
+
+        final Map<String, String> names = new java.util.LinkedHashMap<>();
+        names.put("biome.custom.crystal_forest", "Crystal Forest");
+        names.put("biome.custom.火山", "Volcano");
+        final BiomeLangS2C reply = new BiomeLangS2C(names);
+        final BiomeLangS2C decodedReply = (BiomeLangS2C) MsgCodec.decode(MsgCodec.encode(reply));
+        assertEquals(Proto.MSG_BIOME_LANG_S2C, decodedReply.typeId());
+        assertEquals(names, decodedReply.names());
+    }
+
+    @Test
+    void biomeLangReplyEnforcesItsEntryCap() throws ProtoException {
+        final Map<String, String> names = new java.util.LinkedHashMap<>();
+        for (int i = 0; i <= Proto.MAX_BIOME_LANG_ENTRIES; i++) {
+            names.put("biome.big.b" + i, "B" + i);
+        }
+        assertThrows(ProtoException.class, () -> MsgCodec.encode(new BiomeLangS2C(names)));
+    }
+
+    @Test
+    void fullSyncManifestRoundTrips() throws ProtoException {
+        final List<MapFullSyncManifestS2C.RegionCoord> regions = List.of(
+            new MapFullSyncManifestS2C.RegionCoord(-5, 7),
+            new MapFullSyncManifestS2C.RegionCoord(0, 0)
+        );
+        final MapFullSyncManifestS2C page =
+            new MapFullSyncManifestS2C(0xBEEF, 2, 3, 1, 4, false, regions);
+        final MapFullSyncManifestS2C decoded =
+            (MapFullSyncManifestS2C) MsgCodec.decode(MsgCodec.encode(page));
+        assertEquals(Proto.MSG_MAP_FULL_SYNC_MANIFEST_S2C, decoded.typeId());
+        assertEquals(0xBEEF, decoded.syncId());
+        assertEquals(2, decoded.dimIndex());
+        assertEquals(3, decoded.lod());
+        assertEquals(1, decoded.pageIndex());
+        assertEquals(4, decoded.pageCount());
+        assertFalse(decoded.cancel());
+        assertEquals(regions, decoded.regions());
+
+        final MapFullSyncManifestS2C cancel = MapFullSyncManifestS2C.cancel(0);
+        final MapFullSyncManifestS2C decodedCancel =
+            (MapFullSyncManifestS2C) MsgCodec.decode(MsgCodec.encode(cancel));
+        assertTrue(decodedCancel.cancel());
+        assertTrue(decodedCancel.regions().isEmpty());
+    }
+
+    @Test
+    void fullSyncManifestRejectsOutOfRangeFields() throws ProtoException {
+        final List<MapFullSyncManifestS2C.RegionCoord> regions = List.of(
+            new MapFullSyncManifestS2C.RegionCoord(1, 1)
+        );
+        assertThrows(ProtoException.class,
+            () -> MsgCodec.encode(new MapFullSyncManifestS2C(0x10000, 0, 0, 0, 1, false, regions)));
+        assertThrows(ProtoException.class,
+            () -> MsgCodec.encode(new MapFullSyncManifestS2C(0, Proto.MAX_DIM_ENTRIES, 0, 0, 1, false, regions)));
+        assertThrows(ProtoException.class,
+            () -> MsgCodec.encode(new MapFullSyncManifestS2C(0, 0, Proto.DEFAULT_MAX_PATCH_LOD + 1, 0, 1, false, regions)));
+        assertThrows(ProtoException.class,
+            () -> MsgCodec.encode(new MapFullSyncManifestS2C(0, 0, 0, 0, 0, false, regions)));
+        assertThrows(ProtoException.class,
+            () -> MsgCodec.encode(new MapFullSyncManifestS2C(0, 0, 0, 0, Proto.MAX_FULL_SYNC_PAGES + 1, false, regions)));
+        assertThrows(ProtoException.class,
+            () -> MsgCodec.encode(new MapFullSyncManifestS2C(0, 0, 0, 2, 2, false, regions)));
+        // A cancel page carrying regions is not a valid control page.
+        assertThrows(ProtoException.class,
+            () -> MsgCodec.encode(new MapFullSyncManifestS2C(0, 0, 0, 0, 1, true, regions)));
+    }
+
+    @Test
+    void fullSyncManifestPageRegionCapIsEnforcedInBothDirections() throws Exception {
+        final List<MapFullSyncManifestS2C.RegionCoord> tooMany = new ArrayList<>();
+        for (int i = 0; i <= Proto.MAX_FULL_SYNC_PAGE_REGIONS; i++) {
+            tooMany.add(new MapFullSyncManifestS2C.RegionCoord(i, 0));
+        }
+        assertThrows(ProtoException.class,
+            () -> MsgCodec.encode(new MapFullSyncManifestS2C(0, 0, 0, 0, 1, false, tooMany)));
+
+        // A forged wire page claiming more regions than the cap must be rejected on decode.
+        final java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+        final java.io.DataOutputStream out = new java.io.DataOutputStream(bytes);
+        out.writeShort(1);
+        out.writeByte(0);
+        out.writeByte(0);
+        out.writeByte(0);
+        out.writeByte(1);
+        out.writeByte(0);
+        out.writeShort(Proto.MAX_FULL_SYNC_PAGE_REGIONS + 1);
+        out.flush();
+        final byte[] payload = new byte[bytes.size() + 1];
+        payload[0] = (byte) Proto.MSG_MAP_FULL_SYNC_MANIFEST_S2C;
+        System.arraycopy(bytes.toByteArray(), 0, payload, 1, bytes.size());
+        assertThrows(ProtoException.class, () -> MsgCodec.decode(payload));
+    }
+
+    private static List<HelloPolicyS2C.DimDescriptor> randomDims(final Random rng) {
+        final int n = rng.nextInt(Proto.MAX_DIM_ENTRIES) + 1;
+        final HelloPolicyS2C.DimDescriptor[] dims = new HelloPolicyS2C.DimDescriptor[n];
+        for (int i = 0; i < n; i++) {
+            final boolean predictable = rng.nextBoolean();
+            final boolean hasSeed = rng.nextBoolean();
+            final WorldPreset[] presets = WorldPreset.values();
+            dims[i] = new HelloPolicyS2C.DimDescriptor(
+                "minecraft:dim" + i, "dim" + i, predictable, hasSeed, rng.nextLong(),
+                presets[rng.nextInt(presets.length)]
+            );
+        }
+        return Arrays.asList(dims);
+    }
+
+    private static String randomUtf8(final Random rng, final int maxLen) {
+        final int len = rng.nextInt(maxLen) + 1;
+        final StringBuilder sb = new StringBuilder(len);
+        for (int i = 0; i < len; i++) {
+            sb.append((char) ('a' + rng.nextInt(26)));
+        }
+        return sb.toString();
+    }
+
+    private static String randomUuidString(final Random rng) {
+        final byte[] raw = new byte[16];
+        rng.nextBytes(raw);
+        return java.util.UUID.nameUUIDFromBytes(raw).toString();
+    }
+}

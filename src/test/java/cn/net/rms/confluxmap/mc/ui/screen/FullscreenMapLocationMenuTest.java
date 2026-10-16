@@ -1,0 +1,510 @@
+package cn.net.rms.confluxmap.mc.ui.screen;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import cn.net.rms.confluxmap.compat.Keys;
+import cn.net.rms.confluxmap.core.model.DimensionId;
+import cn.net.rms.confluxmap.core.model.MapLayer;
+import cn.net.rms.confluxmap.core.predict.StructureIndex;
+import cn.net.rms.confluxmap.core.store.ColumnStore;
+import cn.net.rms.confluxmap.core.waypoint.Waypoint;
+import cn.net.rms.confluxmap.core.waypoint.WaypointRenderEntry;
+import cn.net.rms.confluxmap.mc.ui.world.WaypointHighlightState;
+import cn.net.rms.confluxmap.mc.world.DimensionLayerPolicy;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.OptionalInt;
+import java.util.UUID;
+import org.junit.jupiter.api.Test;
+
+class FullscreenMapLocationMenuTest {
+    @Test
+    void locationMenuCoversMapOverlaysWithoutSuppressingThem() throws IOException {
+        final String source = Files.readString(projectRoot().resolve(
+            "src/main/java/cn/net/rms/confluxmap/mc/ui/screen/FullscreenMapScreen.java"
+        )).replace("\r\n", "\n");
+        final String occlusion = between(
+            source,
+            "private boolean mapOverlayIntersectsUi(\n        final float left",
+            "    private static boolean intersects"
+        );
+
+        assertFalse(
+            occlusion.contains("locationMenuBounds"),
+            "the location menu must cover map overlays instead of suppressing them"
+        );
+        assertTrue(
+            occlusion.contains("locationActionTooltips.containsKey(widget)"),
+            "location-menu buttons must be excluded from generic widget avoidance"
+        );
+
+        final String render = between(
+            source,
+            "protected void renderContents(",
+            "    private void drawExportSelection"
+        );
+        final int menu = render.indexOf("drawLocationMenu(draw);");
+        assertTrue(render.indexOf("drawStructures(draw, mouseX, mouseY);") < menu);
+        assertTrue(render.indexOf("drawRadar(draw, tickDelta, mouseX, mouseY);") < menu);
+        assertTrue(render.indexOf("drawWaypoints(draw, mouseX, mouseY, radarObserver);") < menu);
+    }
+
+    @Test
+    void teleportStaysFirstWhetherOrNotTheCommandIsUsable() {
+        assertEquals(List.of(
+            FullscreenMapLocationMenu.Action.TELEPORT,
+            FullscreenMapLocationMenu.Action.SET_WAYPOINT,
+            FullscreenMapLocationMenu.Action.SHARE_LOCATION,
+            FullscreenMapLocationMenu.Action.HIGHLIGHT
+        ), FullscreenMapLocationMenu.actions(false, false));
+        assertEquals(List.of(
+            FullscreenMapLocationMenu.Action.TELEPORT,
+            FullscreenMapLocationMenu.Action.EDIT_WAYPOINT,
+            FullscreenMapLocationMenu.Action.DELETE_WAYPOINT,
+            FullscreenMapLocationMenu.Action.SHARE_WAYPOINT,
+            FullscreenMapLocationMenu.Action.HIGHLIGHT_WAYPOINT
+        ), FullscreenMapLocationMenu.actions(true, false));
+    }
+
+    @Test
+    void replacesHighlightWithClearOnlyForTheCurrentTarget() {
+        assertEquals(List.of(
+            FullscreenMapLocationMenu.Action.TELEPORT,
+            FullscreenMapLocationMenu.Action.SET_WAYPOINT,
+            FullscreenMapLocationMenu.Action.SHARE_LOCATION,
+            FullscreenMapLocationMenu.Action.CLEAR_HIGHLIGHT
+        ), FullscreenMapLocationMenu.actions(false, true));
+        assertEquals(List.of(
+            FullscreenMapLocationMenu.Action.TELEPORT,
+            FullscreenMapLocationMenu.Action.EDIT_WAYPOINT,
+            FullscreenMapLocationMenu.Action.DELETE_WAYPOINT,
+            FullscreenMapLocationMenu.Action.SHARE_WAYPOINT,
+            FullscreenMapLocationMenu.Action.CLEAR_HIGHLIGHT
+        ), FullscreenMapLocationMenu.actions(true, true));
+    }
+
+    @Test
+    void usesPlayerHighlightActionsWhenRightClickingAPlayer() {
+        assertEquals(List.of(
+            FullscreenMapLocationMenu.Action.TELEPORT,
+            FullscreenMapLocationMenu.Action.SET_WAYPOINT,
+            FullscreenMapLocationMenu.Action.SHARE_LOCATION,
+            FullscreenMapLocationMenu.Action.HIGHLIGHT_PLAYER
+        ), FullscreenMapLocationMenu.actions(false, false, true));
+        assertEquals(List.of(
+            FullscreenMapLocationMenu.Action.TELEPORT,
+            FullscreenMapLocationMenu.Action.SET_WAYPOINT,
+            FullscreenMapLocationMenu.Action.SHARE_LOCATION,
+            FullscreenMapLocationMenu.Action.CLEAR_PLAYER_HIGHLIGHT
+        ), FullscreenMapLocationMenu.actions(false, true, true));
+    }
+
+    @Test
+    void syntheticHighlightedLocationIsNotTreatedAsASavedWaypoint() {
+        assertFalse(FullscreenMapLocationMenu.isSavedWaypoint(new WaypointRenderEntry(
+            WaypointHighlightState.SELECTED_LOCATION_ID,
+            "Selected location",
+            DimensionId.OVERWORLD,
+            10.5,
+            64.0,
+            20.5,
+            0xFFFFFFFF,
+            Waypoint.Type.NORMAL,
+            WaypointRenderEntry.Source.LOCAL
+        )));
+        assertTrue(FullscreenMapLocationMenu.isSavedWaypoint(new WaypointRenderEntry(
+            UUID.randomUUID(),
+            "Saved waypoint",
+            DimensionId.OVERWORLD,
+            10.5,
+            64.0,
+            20.5,
+            0xFFFFFFFF,
+            Waypoint.Type.NORMAL,
+            WaypointRenderEntry.Source.LOCAL
+        )));
+    }
+
+    @Test
+    void editActionOnlyDependsOnWaypointPermission() {
+        assertTrue(FullscreenMapLocationMenu.actionEnabled(
+            FullscreenMapLocationMenu.Action.EDIT_WAYPOINT, true, false, true, false
+        ));
+        assertFalse(FullscreenMapLocationMenu.actionEnabled(
+            FullscreenMapLocationMenu.Action.EDIT_WAYPOINT, true, false, false, true
+        ));
+    }
+
+    @Test
+    void deleteActionOnlyDependsOnWaypointPermission() {
+        assertTrue(FullscreenMapLocationMenu.actionEnabled(
+            FullscreenMapLocationMenu.Action.DELETE_WAYPOINT, true, false, false, true
+        ));
+        assertFalse(FullscreenMapLocationMenu.actionEnabled(
+            FullscreenMapLocationMenu.Action.DELETE_WAYPOINT, true, false, true, false
+        ));
+    }
+
+    @Test
+    void opensBesideTheCursorWithoutLeavingTheViewport() {
+        final FullscreenMapLocationMenu.Bounds topLeft = FullscreenMapLocationMenu.place(
+            20, 20, 320, 240, 4
+        );
+        final FullscreenMapLocationMenu.Bounds bottomRight = FullscreenMapLocationMenu.place(
+            315, 235, 320, 240, 5
+        );
+
+        assertTrue(topLeft.x() > 20);
+        assertTrue(topLeft.y() > 20);
+        assertTrue(bottomRight.x() + bottomRight.width() < 315);
+        assertTrue(bottomRight.y() + bottomRight.height() < 235);
+        assertInsideViewport(topLeft, 320, 240);
+        assertInsideViewport(bottomRight, 320, 240);
+    }
+
+    @Test
+    void growsThePanelForTheWaypointDeleteAction() {
+        final FullscreenMapLocationMenu.Bounds location = FullscreenMapLocationMenu.place(
+            20, 20, 320, 240, 4
+        );
+        final FullscreenMapLocationMenu.Bounds waypoint = FullscreenMapLocationMenu.place(
+            20, 20, 320, 240, 5
+        );
+
+        assertEquals(
+            FullscreenMapLocationMenu.BUTTON_HEIGHT + FullscreenMapLocationMenu.BUTTON_GAP,
+            waypoint.height() - location.height()
+        );
+    }
+
+    @Test
+    void targetUsesTheAirBlockAboveTheEstimatedSurface() {
+        final FullscreenMapLocationMenu.Target target = FullscreenMapLocationMenu.targetAt(
+            -11.01, OptionalInt.of(72), 8.97
+        );
+
+        assertEquals(-12, target.blockX());
+        assertEquals(8, target.blockZ());
+        assertEquals(73, target.blockY().orElseThrow());
+    }
+
+    @Test
+    void targetWithoutSurfaceDataHasNoEstimatedY() {
+        final FullscreenMapLocationMenu.Target target = FullscreenMapLocationMenu.targetAt(
+            10.0, OptionalInt.empty(), 20.0
+        );
+
+        assertTrue(target.blockY().isEmpty());
+        assertFalse(target.groundKnown());
+    }
+
+    @Test
+    void knownVoidTargetHasNoYButIsAGroundedAnswer() {
+        final FullscreenMapLocationMenu.Target target = FullscreenMapLocationMenu.targetAt(
+            10.0, new ColumnStore.SurfaceLookup(true, OptionalInt.empty()), 20.0
+        );
+
+        assertTrue(target.blockY().isEmpty());
+        assertTrue(target.groundKnown());
+    }
+
+    @Test
+    void placementYUsesTheSurfaceAboveTheColumnOrThePlayersYWithoutOne() {
+        assertEquals(73, FullscreenMapLocationMenu.targetAt(
+            10.0, OptionalInt.of(72), 20.0
+        ).placementY(100));
+        assertEquals(64, FullscreenMapLocationMenu.targetAt(
+            10.0, ColumnStore.SurfaceLookup.UNKNOWN, 20.0
+        ).placementY(64));
+        assertEquals(64, FullscreenMapLocationMenu.targetAt(
+            10.0, new ColumnStore.SurfaceLookup(true, OptionalInt.empty()), 20.0
+        ).placementY(64));
+    }
+
+    @Test
+    void liveSessionsTeleportWithoutAnyGroundAnswerButBrowsedOnesNeedOne() {
+        final FullscreenMapLocationMenu.Target unknown = FullscreenMapLocationMenu.targetAt(
+            10.0, ColumnStore.SurfaceLookup.UNKNOWN, 20.0
+        );
+        final FullscreenMapLocationMenu.Target voidColumn = FullscreenMapLocationMenu.targetAt(
+            10.0, new ColumnStore.SurfaceLookup(true, OptionalInt.empty()), 20.0
+        );
+        final FullscreenMapLocationMenu.Target surface = FullscreenMapLocationMenu.targetAt(
+            10.0, OptionalInt.of(63), 20.0
+        );
+
+        assertTrue(FullscreenMapLocationMenu.teleportPositionKnown(unknown, true),
+            "a live session resolves the landing from the loaded target chunk");
+        assertFalse(FullscreenMapLocationMenu.teleportPositionKnown(unknown, false),
+            "a browsed session has no chunk to resolve an unknown target from");
+        assertTrue(FullscreenMapLocationMenu.teleportPositionKnown(voidColumn, false));
+        assertTrue(FullscreenMapLocationMenu.teleportPositionKnown(surface, false));
+    }
+
+    @Test
+    void placementActionsStayEnabledWithoutAGroundAnswer() {
+        assertTrue(FullscreenMapLocationMenu.actionEnabled(
+            FullscreenMapLocationMenu.Action.SET_WAYPOINT, true, false
+        ));
+        assertTrue(FullscreenMapLocationMenu.actionEnabled(
+            FullscreenMapLocationMenu.Action.SHARE_LOCATION, true, false
+        ));
+        assertFalse(FullscreenMapLocationMenu.actionEnabled(
+            FullscreenMapLocationMenu.Action.SET_WAYPOINT, false, false
+        ));
+        assertFalse(FullscreenMapLocationMenu.actionEnabled(
+            FullscreenMapLocationMenu.Action.SHARE_LOCATION, false, false
+        ));
+    }
+
+    @Test
+    void teleportFollowsOnlyTheCommandAvailability() {
+        assertTrue(FullscreenMapLocationMenu.actionEnabled(
+            FullscreenMapLocationMenu.Action.TELEPORT, true, true
+        ));
+        assertFalse(FullscreenMapLocationMenu.actionEnabled(
+            FullscreenMapLocationMenu.Action.TELEPORT, true, false
+        ));
+        assertTrue(FullscreenMapLocationMenu.actionEnabled(
+            FullscreenMapLocationMenu.Action.SHARE_WAYPOINT, true, false
+        ));
+    }
+
+    @Test
+    void targetFloorsNegativeCoordinatesWithoutCrossingTheOrigin() {
+        final FullscreenMapLocationMenu.Target target = FullscreenMapLocationMenu.targetAt(
+            -0.1, OptionalInt.of(10), -0.1
+        );
+
+        assertEquals(-1, target.blockX());
+        assertEquals(-1, target.blockZ());
+    }
+
+    @Test
+    void hoveredStructureSuppliesTheExactRightClickCoordinates() {
+        final FullscreenMapLocationMenu.Point point = FullscreenMapLocationMenu.pointAt(
+            31.75,
+            47.25,
+            new StructureIndex.Marker(
+                StructureIndex.StructureType.VILLAGE,
+                32,
+                48,
+                2,
+                StructureIndex.State.CANDIDATE
+            )
+        );
+
+        assertEquals(32, point.blockX());
+        assertEquals(48, point.blockZ());
+    }
+
+    @Test
+    void emptyMapRightClickKeepsTheCursorCoordinates() {
+        final FullscreenMapLocationMenu.Point point = FullscreenMapLocationMenu.pointAt(
+            -0.1, 8.97, null
+        );
+
+        assertEquals(-1, point.blockX());
+        assertEquals(8, point.blockZ());
+    }
+
+    @Test
+    void heightLookupUsesTheTopSurfaceLayerForEachDimensionKind() {
+        assertEquals(
+            MapLayer.SURFACE,
+            FullscreenMapLocationMenu.topSurfaceLayer(DimensionLayerPolicy.DimensionKind.SKY_LIT)
+        );
+        assertEquals(
+            MapLayer.END_SURFACE,
+            FullscreenMapLocationMenu.topSurfaceLayer(DimensionLayerPolicy.DimensionKind.NO_SKY_NO_CEILING)
+        );
+        assertEquals(
+            MapLayer.NETHER_CEILING,
+            FullscreenMapLocationMenu.topSurfaceLayer(DimensionLayerPolicy.DimensionKind.HAS_CEILING)
+        );
+    }
+
+    @Test
+    void splitMapScreensHostTheRightClickLocationMenu() throws IOException {
+        final Path root = projectRoot();
+        final String pane = Files.readString(root.resolve(
+            "src/main/java/cn/net/rms/confluxmap/mc/ui/screen/SplitMapPane.java"
+        )).replace("\r\n", "\n");
+        assertTrue(
+            pane.contains("map.openEmbeddedLocationMenu(mouseX, mouseY, layout)"),
+            "the split map pane must capture menu targets through the embedded map"
+        );
+        assertTrue(
+            pane.contains("map.runLocationAction(action, target, waypoint, playerId, host)"),
+            "the split map pane must run actions on the embedded map with itself as return screen"
+        );
+        assertTrue(
+            pane.contains("map.locationMenuButtonSpecs("),
+            "the split map pane must reuse the fullscreen menu's button specs"
+        );
+
+        for (final String name : new String[] {
+            "StructureSearchScreen", "StructureCandidateScreen", "BiomeCandidateScreen"
+        }) {
+            final String source = Files.readString(root.resolve(
+                "src/main/java/cn/net/rms/confluxmap/mc/ui/screen/" + name + ".java"
+            )).replace("\r\n", "\n");
+            assertTrue(
+                source.contains("mapPane.addMenuButtons(this)"),
+                name + " must re-add the menu buttons when its widgets are rebuilt"
+            );
+            final int outsideGuard = source.indexOf("mapPane.menuClickedOutside(this,");
+            final int widgetDispatch = source.indexOf("super.mouseClicked");
+            final int consume = source.indexOf("mapPane.consumePendingMenuAction(this)");
+            assertTrue(
+                outsideGuard >= 0 && widgetDispatch > outsideGuard && consume > widgetDispatch,
+                name + " must route clicks around the open menu before its widget dispatch"
+            );
+        }
+    }
+
+    @Test
+    void digitShortcutsFollowTheLiveButtonList() {
+        final List<FullscreenMapLocationMenu.ButtonSpec> specs = List.of(
+            new FullscreenMapLocationMenu.ButtonSpec(
+                FullscreenMapLocationMenu.Action.TELEPORT, "teleport", "teleport.tip", true
+            ),
+            new FullscreenMapLocationMenu.ButtonSpec(
+                FullscreenMapLocationMenu.Action.DELETE_WAYPOINT, "delete", "delete.tip", false
+            )
+        );
+
+        assertEquals(
+            FullscreenMapLocationMenu.Action.TELEPORT,
+            FullscreenMapLocationMenu.actionForHotkey(specs, Keys.DIGIT_1)
+        );
+        assertNull(
+            FullscreenMapLocationMenu.actionForHotkey(specs, Keys.DIGIT_2),
+            "a greyed-out button must not fire from its shortcut"
+        );
+        assertNull(
+            FullscreenMapLocationMenu.actionForHotkey(specs, Keys.DIGIT_3),
+            "a shortcut with no button must do nothing"
+        );
+        assertNull(
+            FullscreenMapLocationMenu.actionForHotkey(specs, Keys.ESCAPE),
+            "non-digit keys are not menu shortcuts"
+        );
+    }
+
+    @Test
+    void everyMenuActionHasADigitShortcut() {
+        for (final boolean existingWaypoint : new boolean[] {false, true}) {
+            for (final boolean highlighted : new boolean[] {false, true}) {
+                for (final boolean playerTarget : new boolean[] {false, true}) {
+                    final List<FullscreenMapLocationMenu.Action> actions =
+                        FullscreenMapLocationMenu.actions(existingWaypoint, highlighted, playerTarget);
+                    assertNotNull(
+                        FullscreenMapLocationMenu.hotkeyLabel(actions.size() - 1),
+                        "the menu outgrew its digit shortcuts: " + actions
+                    );
+                }
+            }
+        }
+        assertEquals("1", FullscreenMapLocationMenu.hotkeyLabel(0));
+        assertEquals("5", FullscreenMapLocationMenu.hotkeyLabel(4));
+        assertNull(FullscreenMapLocationMenu.hotkeyLabel(5));
+        assertEquals(0, FullscreenMapLocationMenu.hotkeyIndex(Keys.DIGIT_1));
+        assertEquals(4, FullscreenMapLocationMenu.hotkeyIndex(Keys.DIGIT_5));
+        assertEquals(-1, FullscreenMapLocationMenu.hotkeyIndex(Keys.ESCAPE));
+    }
+
+    @Test
+    void menusTriggerFromDigitKeysWithoutStealingTyping() throws IOException {
+        final Path root = projectRoot();
+        final String base = Files.readString(root.resolve(
+            "src/main/java/cn/net/rms/confluxmap/mc/ui/screen/ConfluxScreen.java"
+        )).replace("\r\n", "\n");
+        assertTrue(
+            base.contains(
+                "!(getFocused() instanceof TextFieldWidget) && embeddedMenuHotkeyPressed(keyCode)"
+            ),
+            "the shared key funnel must offer menu shortcuts only when no text field holds focus"
+        );
+        assertTrue(
+            base.contains("void clearFocusForOpenMenu()"),
+            "the embedded hosts must be able to drop text focus while a menu is open"
+        );
+
+        final String pane = Files.readString(root.resolve(
+            "src/main/java/cn/net/rms/confluxmap/mc/ui/screen/SplitMapPane.java"
+        )).replace("\r\n", "\n");
+        assertTrue(
+            pane.contains("FullscreenMapLocationMenu.actionForHotkey(menuSpecs, keyCode)"),
+            "the split map pane must resolve shortcuts against its live button list"
+        );
+        assertTrue(
+            pane.contains("host.clearFocusForOpenMenu();"),
+            "the pane must keep text focus off the search field while its menu is open"
+        );
+
+        final String fullscreen = Files.readString(root.resolve(
+            "src/main/java/cn/net/rms/confluxmap/mc/ui/screen/FullscreenMapScreen.java"
+        )).replace("\r\n", "\n");
+        assertTrue(
+            fullscreen.contains("FullscreenMapLocationMenu.actionForHotkey(locationMenuSpecs, keyCode)"),
+            "the fullscreen map must resolve shortcuts against its live button list"
+        );
+        assertTrue(
+            fullscreen.contains("FullscreenMapLocationMenu.drawHotkeyHints("),
+            "the fullscreen map must draw the digit hints over its menu buttons"
+        );
+
+        for (final String name : new String[] {
+            "StructureSearchScreen", "StructureCandidateScreen", "BiomeCandidateScreen"
+        }) {
+            final String source = Files.readString(root.resolve(
+                "src/main/java/cn/net/rms/confluxmap/mc/ui/screen/" + name + ".java"
+            )).replace("\r\n", "\n");
+            assertTrue(
+                source.contains("mapPane.menuHotkeyPressed(this, keyCode)"),
+                name + " must route key events into the open menu's shortcuts"
+            );
+            assertTrue(
+                source.contains("mapPane.drawMenuHotkeys(draw, this.textRenderer)"),
+                name + " must draw the digit hints over the open menu's buttons"
+            );
+        }
+    }
+
+    private static void assertInsideViewport(
+        final FullscreenMapLocationMenu.Bounds bounds,
+        final int viewportWidth,
+        final int viewportHeight
+    ) {
+        assertTrue(bounds.x() >= FullscreenMapLocationMenu.SCREEN_MARGIN);
+        assertTrue(bounds.y() >= FullscreenMapLocationMenu.SCREEN_MARGIN);
+        assertTrue(bounds.x() + bounds.width() <= viewportWidth - FullscreenMapLocationMenu.SCREEN_MARGIN);
+        assertTrue(bounds.y() + bounds.height() <= viewportHeight - FullscreenMapLocationMenu.SCREEN_MARGIN);
+    }
+
+    private static String between(final String source, final String start, final String end) {
+        final int startIndex = source.indexOf(start);
+        final int endIndex = source.indexOf(end, startIndex);
+        assertTrue(startIndex >= 0 && endIndex > startIndex, "expected source section must exist");
+        return source.substring(startIndex, endIndex);
+    }
+
+    private static Path projectRoot() {
+        Path current = Path.of("").toAbsolutePath().normalize();
+        while (current != null) {
+            if (Files.isRegularFile(current.resolve("common.gradle"))
+                && Files.isDirectory(current.resolve("src/main/java"))) {
+                return current;
+            }
+            current = current.getParent();
+        }
+        throw new IllegalStateException("Could not locate the Conflux Map project root");
+    }
+}

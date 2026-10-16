@@ -1,0 +1,701 @@
+package cn.net.rms.confluxmap.core.config;
+
+import cn.net.rms.confluxmap.core.color.MapColorStyle;
+import cn.net.rms.confluxmap.core.loadstate.ChunkLoadDetailMode;
+import cn.net.rms.confluxmap.core.loadstate.FullscreenDisplayMode;
+import cn.net.rms.confluxmap.core.portal.PortalKind;
+import cn.net.rms.confluxmap.core.predict.PredictionViewMode;
+import cn.net.rms.confluxmap.core.survey.SurveyReminderSchedule;
+import cn.net.rms.confluxmap.core.util.TileMath;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+
+/**
+ * All client settings, serialized as one JSON document.
+ * Add fields with defaults only; never rename without bumping
+ * {@link #SCHEMA_VERSION} and adding a migration in {@link ConfigIo}.
+ */
+public final class ConfluxConfig {
+    public static final int SCHEMA_VERSION = 12;
+    public static final String DEFAULT_TELEPORT_COMMAND = "execute in {dimension} run tp @s {x} {y} {z}";
+    public static final int DEFAULT_MINIMAP_SIZE = 90;
+    public static final int MINIMAP_ZOOM_LEVEL_COUNT = 4;
+    public static final int MIN_ANNOTATION_ERASER_SIZE = 4;
+    public static final int MAX_ANNOTATION_ERASER_SIZE = 64;
+    public static final int DEFAULT_ANNOTATION_ERASER_SIZE = 16;
+    public static final int MIN_RADAR_ICON_SIZE = 4;
+    public static final int MAX_RADAR_ICON_SIZE = 16;
+    public static final int DEFAULT_RADAR_ICON_SIZE = 10;
+    public static final int MIN_RADAR_ICON_OUTLINE_THICKNESS = 0;
+    public static final int MAX_RADAR_ICON_OUTLINE_THICKNESS = 4;
+    public static final int DEFAULT_RADAR_ICON_OUTLINE_THICKNESS = 1;
+    public static final int MIN_RADAR_PLAYER_HIGHLIGHT_GHOST_SECONDS = 0;
+    public static final int MAX_RADAR_PLAYER_HIGHLIGHT_GHOST_SECONDS = 300;
+    public static final int DEFAULT_RADAR_PLAYER_HIGHLIGHT_GHOST_SECONDS = 30;
+    public static final int MIN_WAYPOINT_ICON_OPACITY = 0;
+    public static final int MAX_WAYPOINT_ICON_OPACITY = 100;
+    public static final int DEFAULT_WAYPOINT_ICON_OPACITY = 100;
+    public static final int DEFAULT_WAYPOINT_RENDER_DISTANCE = 1_000;
+    public static final int MIN_WAYPOINT_HIGHLIGHT_DIM_OPACITY = 0;
+    public static final int MAX_WAYPOINT_HIGHLIGHT_DIM_OPACITY = 100;
+    /** Preserve the previous hard-coded highlight dimming behavior. */
+    public static final int DEFAULT_WAYPOINT_HIGHLIGHT_DIM_OPACITY = 28;
+    public static final int MIN_PLAYER_TRAIL_DURATION_SECONDS = 1;
+    public static final int MAX_PLAYER_TRAIL_DURATION_SECONDS = 120;
+    public static final int DEFAULT_PLAYER_TRAIL_DURATION_SECONDS = 4;
+    public static final int MIN_PLAYER_TRAIL_DOT_SIZE = 1;
+    public static final int MAX_PLAYER_TRAIL_DOT_SIZE = 8;
+    public static final int DEFAULT_PLAYER_TRAIL_DOT_SIZE = 3;
+    /** Mirrors the 300% upper bound: one third of default size. */
+    public static final int MIN_WAYPOINT_LABEL_SCALE_PERCENT = 33;
+    public static final int MAX_WAYPOINT_LABEL_SCALE_PERCENT = 300;
+    public static final int DEFAULT_WAYPOINT_LABEL_SCALE_PERCENT = 100;
+    /** Always hide structure icons at the furthest fullscreen-map zoom. */
+    public static final double MIN_PREDICTION_STRUCTURE_ICON_HIDE_ZOOM = 0.0625;
+    /** Largest fullscreen-map zoom multiplier the renderer can display. */
+    public static final double MAX_PREDICTION_STRUCTURE_ICON_HIDE_ZOOM = 4.0;
+    /** Preserve the old default: hide only at the furthest 0.0625x zoom. */
+    public static final double DEFAULT_PREDICTION_STRUCTURE_ICON_HIDE_ZOOM = 0.0625;
+    public static final int MIN_PORTAL_ICON_SIZE = 8;
+    public static final int MAX_PORTAL_ICON_SIZE = 32;
+    public static final int DEFAULT_PORTAL_ICON_SIZE = 14;
+    public static final int MIN_PORTAL_ICON_OPACITY = 0;
+    public static final int MAX_PORTAL_ICON_OPACITY = 100;
+    public static final int DEFAULT_PORTAL_ICON_OPACITY = 90;
+    public static final double MIN_PORTAL_ICON_HIDE_ZOOM = 0.0625;
+    public static final double MAX_PORTAL_ICON_HIDE_ZOOM = 4.0;
+    public static final double DEFAULT_PORTAL_ICON_HIDE_ZOOM = 0.0625;
+    /** Schema-v4 lower bound for the now-retired blocks-per-pixel setting. */
+    private static final double LEGACY_MIN_PREDICTION_STRUCTURE_ICON_HIDE_SCALE = 0.25;
+    /** Schema-v4 upper bound for the now-retired blocks-per-pixel setting. */
+    private static final double LEGACY_MAX_PREDICTION_STRUCTURE_ICON_HIDE_SCALE = 16.0;
+    /** Schema-v9 default for the trail retention window, retired as far too long. */
+    private static final int LEGACY_PLAYER_TRAIL_DURATION_SECONDS = 120;
+    /** Schema-v10 default teleport command; could not switch dimensions. */
+    private static final String LEGACY_TELEPORT_COMMAND = "tp {x} {y} {z}";
+
+    public int schemaVersion = SCHEMA_VERSION;
+
+    /** Serialized only by schema v1; retained so old files can be migrated. */
+    @Deprecated
+    public enum Corner { TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT }
+
+    public enum Shape { SQUARE, CIRCLE }
+
+    public enum PlayerMarkerStyle { TRADITIONAL, MODERN }
+
+    /**
+     * Map quality preset governing the slope (loadline) at which fullscreen and minimap views
+     * transition between LOD levels as scale increases.
+     * Scale <= 1.0 is strictly clamped to LOD 0 regardless of setting.
+     */
+    public enum MapQuality {
+        ULTRA_PERFORMANCE(1.60),
+        PERFORMANCE(1.30),
+        BALANCED(1.00),
+        QUALITY(0.75),
+        ULTRA_QUALITY(0.55);
+
+        private final double slope;
+
+        MapQuality(final double slope) {
+            this.slope = slope;
+        }
+
+        public double slope() {
+            return slope;
+        }
+    }
+
+    public enum RadarDisplayMode { DOTS, PORTRAITS }
+
+    /** Preset portal chunk-highlight fills; the alpha is baked in so a fill stays translucent. */
+    public enum PortalHighlightColor {
+        PURPLE(0x508036C9),
+        GOLD(0x50E5A02B),
+        CYAN(0x5037B7C9),
+        RED(0x50D0483C),
+        GREEN(0x505FA83C);
+
+        private final int argb;
+
+        PortalHighlightColor(final int argb) {
+            this.argb = argb;
+        }
+
+        public int argb() {
+            return argb;
+        }
+    }
+
+    /**
+     * Manual layer override cycled by {@code key.confluxmap.cycle_layer}; see
+     * {@code mc.world.LayerSelector} for how each dimension interprets these
+     * (e.g. FORCE_UNDERGROUND means CAVE_AUTO in the Overworld and NETHER_CEILING
+     * in the Nether, while FORCE_SLICE selects that dimension's configured fixed Y).
+     */
+    public enum LayerOverride { AUTO, FORCE_SURFACE, FORCE_UNDERGROUND, FORCE_SLICE }
+
+    /** Which tab the waypoint list opens on when summoned by the mod's own hotkey. */
+    public enum WaypointListTab { LOCAL, PUBLIC }
+
+    /** Which dimensions the waypoint list shows when summoned by the mod's own hotkey. */
+    public enum WaypointListDefaultDimension { CURRENT, ALL }
+
+    public boolean minimapEnabled = true;
+    /** Legacy schema-v1 field. Null after migration and omitted from newly written JSON. */
+    @Deprecated
+    public Corner minimapCorner;
+    /** Top-left origin as a fraction of the available horizontal HUD travel. */
+    public double minimapPositionX = 1.0;
+    /** Top-left origin as a fraction of the available vertical HUD travel. */
+    public double minimapPositionY = 0.0;
+    /** Temporarily moves only the minimap to keep it clear of vanilla HUD elements. */
+    public boolean minimapHudAvoidance = true;
+    public Shape minimapShape = Shape.SQUARE;
+    /** Code-drawn player marker used on both map surfaces when no resource pack overrides it. */
+    public PlayerMarkerStyle playerMarkerStyle = PlayerMarkerStyle.MODERN;
+    public int minimapSize = DEFAULT_MINIMAP_SIZE;
+    public boolean minimapRotate = true;
+    public int minimapZoomIndex = 1;
+    public boolean showCoordinates = true;
+    public boolean showBiome = true;
+    /** Show recent player movement as fading red dots on both map surfaces. */
+    public boolean playerTrailEnabled = true;
+    /** Serialized only by schema v2; retained so old files can be migrated. */
+    @Deprecated
+    public Integer playerTrailDurationMinutes;
+    /** Wall-clock retention window for player trail samples. */
+    public int playerTrailDurationSeconds = DEFAULT_PLAYER_TRAIL_DURATION_SECONDS;
+    /** Player trail dot diameter in screen pixels. */
+    public int playerTrailDotSize = DEFAULT_PLAYER_TRAIL_DOT_SIZE;
+    /** Fullscreen map only: subtle chunk-border grid with a highlight on the hovered chunk. */
+    public boolean fullmapChunkGrid = true;
+    /** Copy the private annotation layer onto the minimap HUD. Fullscreen annotations remain visible. */
+    public boolean annotationsOnHud = true;
+    /** Fullscreen annotation eraser diameter in screen pixels. */
+    public int annotationEraserSize = DEFAULT_ANNOTATION_ERASER_SIZE;
+    /** Last requested fullscreen base plane; unavailable server-authoritative modes fall back safely. */
+    public FullscreenDisplayMode fullscreenDisplayMode = FullscreenDisplayMode.TERRAIN;
+    /** Local presentation choice for server chunk levels. */
+    public ChunkLoadDetailMode chunkLoadDetailMode = ChunkLoadDetailMode.BANDS;
+
+    /** cave-nether-layers.md §1/§6: manual pin, or AUTO for the per-dimension automatic detection. */
+    public LayerOverride layerOverride = LayerOverride.AUTO;
+    /** Minimap/fullscreen-map info line: a small text label naming the currently active layer. */
+    public boolean showLayerIndicator = true;
+    /** Fixed-band Y for the Overworld fixed-height preset. */
+    public int caveSliceY = 32;
+    /** Fixed-band Y for the Nether below-bedrock preset. */
+    public int netherSliceY = 64;
+    /**
+     * VoxelMap-style day/night + block-light darkening on the SURFACE layer only (cave/nether/end
+     * layers always keep their baked light). Off = exactly today's fixed-brightness rendering.
+     */
+    public boolean dynamicLighting = true;
+    /** Keeps the historical Conflux renderer by default; XAERO is an explicit presentation choice. */
+    public MapColorStyle mapColorStyle = MapColorStyle.CONFLUX;
+    /** Map quality level controlling LOD scale transition points. */
+    public MapQuality mapQuality = MapQuality.BALANCED;
+
+    public int snapshotBudgetPerTick = 8;
+    public int gpuTileCacheLimit = 256;
+
+    /** Master toggle for the whole entity-radar overlay (docs/reference-specs/radar-icons.md sec 4). */
+    public boolean radarEnabled = true;
+    /** Default minimap marker detail; the player-list key can still temporarily expand dots. */
+    public RadarDisplayMode radarDisplayMode = RadarDisplayMode.PORTRAITS;
+    public boolean radarShowPlayers = true;
+    public boolean radarShowHostile = true;
+    /** Friendly and neutral mobs; enabled so a fresh install exposes the complete entity radar. */
+    public boolean radarShowPassive = true;
+    /** Dropped items, vehicles, projectiles, and defensive fallback targets. */
+    public boolean radarShowOther = true;
+    public boolean radarShowPlayerNames = true;
+    /**
+     * Show player name labels on the minimap without holding the player-list key. The
+     * fullscreen map always honors {@link #radarShowPlayerNames}; this only lifts the
+     * minimap's key-held requirement, and {@link #radarShowPlayerNames} stays the master
+     * switch. Ships off to keep the default minimap uncluttered.
+     */
+    public boolean radarAlwaysShowPlayerNames;
+    public int radarMaxEntities = 100;
+    /** Draw an outline around radar portraits; retained name keeps older config files compatible. */
+    public boolean radarPlayerIconOutlineEnabled = true;
+    /** Radar portrait outline thickness in screen pixels; zero disables the outline. */
+    public int radarIconOutlineThickness = DEFAULT_RADAR_ICON_OUTLINE_THICKNESS;
+    /** Screen-pixel size shared by entity faces and item-form radar icons. */
+    public int radarIconSize = DEFAULT_RADAR_ICON_SIZE;
+    /** Retention window for a highlighted player's last position after changing dimension. */
+    public int radarPlayerHighlightGhostSeconds =
+        DEFAULT_RADAR_PLAYER_HIGHLIGHT_GHOST_SECONDS;
+    /** 3-D straight-line blocks; 0 means "no cutoff" (see waypoint-ux.md S7). */
+    public int waypointRenderDistance = DEFAULT_WAYPOINT_RENDER_DISTANCE;
+    /** Show private, client-owned waypoints on every map/world rendering surface. */
+    public boolean localWaypointsVisible = true;
+    /** Show server-synchronized public waypoints on every map/world rendering surface. */
+    public boolean sharedWaypointsVisible = true;
+    /** Public waypoint IDs allowed to render from the portal-linked dimension on this client. */
+    public Set<String> sharedWaypointCrossDimensionVisibleIds = new LinkedHashSet<>();
+    /**
+     * Per-public-waypoint Y shown when that waypoint renders from the portal-linked dimension
+     * on this client; absent ids keep the waypoint's own Y. Keyed by id string like the
+     * cross-dimension allowlist because the override is the same kind of viewer preference.
+     */
+    public Map<String, Double> sharedWaypointCrossDimensionYById = new LinkedHashMap<>();
+    /**
+     * Show this world's seed-sibling sub-world waypoints on every rendering surface. Siblings are
+     * other world namespaces under the same server address whose observed hashed seed matches; the
+     * toggle ships off so nothing appears until the player opts in.
+     */
+    public boolean crossWorldWaypointsVisible;
+    /** Latest hashed seed observed per multiplayer world identity; powers sibling grouping. */
+    public CrossWorldSeedObservations crossWorldSeedObservations = new CrossWorldSeedObservations();
+    public boolean waypointEdgeIndicatorsEnabled = true;
+    /** Death points kept per dimension, oldest auto-pruned; 0 disables creating new ones. */
+    public int deathPointsKept = 5;
+    /** In-world vertical beam at each visible waypoint's column (see {@code mc.ui.world.WaypointWorldRenderer}). */
+    public boolean waypointBeamsEnabled = true;
+    /** In-world floating name/distance label above each visible waypoint. */
+    public boolean waypointLabelsEnabled = true;
+    /** Opacity percentage for the whole in-world waypoint label (icon, expanded panel background and text); map icons are unchanged. */
+    public int waypointIconOpacity = DEFAULT_WAYPOINT_ICON_OPACITY;
+    /** Opacity retained by non-highlighted waypoints while a highlight is active. */
+    public int waypointHighlightDimOpacity = DEFAULT_WAYPOINT_HIGHLIGHT_DIM_OPACITY;
+    /**
+     * Show the temporary highlighted map location from the portal-linked dimension with
+     * converted coordinates, and keep that highlight alive across same-world dimension
+     * changes (see {@link cn.net.rms.confluxmap.core.waypoint.DimensionScale}).
+     */
+    public boolean highlightCrossDimensionVisible = true;
+    /** Command template used by the fullscreen map's teleport action. */
+    public String teleportCommand = DEFAULT_TELEPORT_COMMAND;
+    /** Close the fullscreen map after its teleport action sends the command. */
+    public boolean teleportCloseMap;
+    /** Which tab the waypoint list opens on when summoned by the mod's own hotkey. */
+    public WaypointListTab waypointListDefaultTab = WaypointListTab.LOCAL;
+    /** Which dimensions the waypoint list shows when summoned by the mod's own hotkey. */
+    public WaypointListDefaultDimension waypointListDefaultDimension = WaypointListDefaultDimension.CURRENT;
+    /**
+     * Apparent size of the in-world waypoint label, as a percentage of the distance-compensated
+     * default. Scales the icon plate, background panel, and both text lines together.
+     */
+    public int waypointLabelScalePercent = DEFAULT_WAYPOINT_LABEL_SCALE_PERCENT;
+
+    /** Master toggle for activated-portal markers (nether/end portals, end gateways) on both map surfaces. */
+    public boolean portalMarkersEnabled = true;
+    /** Draw the portal icon plate at each marker's anchor; the chunk highlight is a separate option. */
+    public boolean portalIconsEnabled = true;
+    /** Custom nether-portal icon texture (resource location); empty keeps the built-in vanilla stand-in. */
+    public String portalIconTextureNether = "";
+    /** Custom end-portal icon texture (resource location); empty keeps the built-in vanilla stand-in. */
+    public String portalIconTextureEnd = "";
+    /** Custom end-gateway icon texture (resource location); empty keeps the built-in vanilla stand-in. */
+    public String portalIconTextureGateway = "";
+    /** Portal icon plate size in screen pixels, shared by minimap and fullscreen map. */
+    public int portalIconSize = DEFAULT_PORTAL_ICON_SIZE;
+    /** Portal icon opacity percentage, applied to plate and texture together. */
+    public int portalIconOpacity = DEFAULT_PORTAL_ICON_OPACITY;
+    /** Fill the chunk containing each portal marker with a translucent color. */
+    public boolean portalChunkHighlightEnabled = true;
+    /** Preset fill color for the chunk highlight. */
+    public PortalHighlightColor portalHighlightColor = PortalHighlightColor.PURPLE;
+    /** Hide portal icons at or below this fullscreen-map zoom multiplier. */
+    public double portalIconHideZoom = DEFAULT_PORTAL_ICON_HIDE_ZOOM;
+
+    /** Master toggle for the seed-predicted fullscreen-map underlay. */
+    public boolean predictionEnabled = true;
+    /**
+     * Client-side opt-out for the companion handshake / correction sync. When false the client
+     * skips HELLO_C2S and never sends MAP_VIEW_REQ; the predicted underlay still works in
+     * singleplayer. S5's request planner reads this flag; S3 only adds it so the config schema
+     * is stable before the sync loop lands.
+     */
+    public boolean predictionNetworkSync = true;
+    /** View filter for the predicted plane; EVERYWHERE is the honest default. */
+    public PredictionViewMode predictionViewMode = PredictionViewMode.EVERYWHERE;
+    public boolean predictionShowStructures = true;
+    /** Hide fullscreen-map structure markers at or below this displayed zoom multiplier. */
+    public double predictionStructureIconHideZoom = DEFAULT_PREDICTION_STRUCTURE_ICON_HIDE_ZOOM;
+    /** Schema-v4 setting retained solely to migrate the incorrectly exposed blocks-per-pixel value. */
+    @Deprecated
+    public Double predictionStructureIconHideScale;
+    /** Schema-v3 setting retained solely to migrate old discrete LOD values. */
+    @Deprecated
+    public Integer predictionStructureMaxLod;
+    /** Per-version and per-dimension structure-type visibility profiles. */
+    public StructureVisibilityConfig predictionStructureVisibility = new StructureVisibilityConfig();
+    /** Client-only multiplayer seed choices, isolated by the current world identity. */
+    public ManualSeedConfig predictionManualSeeds = new ManualSeedConfig();
+    /** Pan-settle debounce, clamped to 100..2000 ms. */
+    public int predictionDebounceMs = 300;
+
+    /** Startup GitHub release probe; drives the chat notice and the fullscreen-map badge. */
+    public boolean updateCheckEnabled = true;
+
+    /** Permanent local opt-out for the unsupported-platform startup warning. */
+    public boolean unsupportedPlatformWarningDismissed;
+
+    /** Cumulative client-open time used only to schedule the optional survey chat reminder. */
+    public long surveyReminderGameOpenMillis;
+    /** Cumulative client-open time at which the next survey reminder becomes due. */
+    public long surveyReminderNextPromptAtMillis = SurveyReminderSchedule.FIRST_DELAY_MILLIS;
+    /** Permanent local opt-out selected through the survey reminder's chat action. */
+    public boolean surveyReminderDismissed;
+
+    public ConfluxConfig copy() {
+        final ConfluxConfig c = new ConfluxConfig();
+        c.schemaVersion = schemaVersion;
+        c.minimapEnabled = minimapEnabled;
+        c.minimapCorner = minimapCorner;
+        c.minimapPositionX = minimapPositionX;
+        c.minimapPositionY = minimapPositionY;
+        c.minimapHudAvoidance = minimapHudAvoidance;
+        c.minimapShape = minimapShape;
+        c.playerMarkerStyle = playerMarkerStyle;
+        c.minimapSize = minimapSize;
+        c.minimapRotate = minimapRotate;
+        c.minimapZoomIndex = minimapZoomIndex;
+        c.showCoordinates = showCoordinates;
+        c.showBiome = showBiome;
+        c.playerTrailEnabled = playerTrailEnabled;
+        c.playerTrailDurationSeconds = playerTrailDurationSeconds;
+        c.playerTrailDotSize = playerTrailDotSize;
+        c.fullmapChunkGrid = fullmapChunkGrid;
+        c.annotationsOnHud = annotationsOnHud;
+        c.annotationEraserSize = annotationEraserSize;
+        c.fullscreenDisplayMode = fullscreenDisplayMode;
+        c.chunkLoadDetailMode = chunkLoadDetailMode;
+        c.layerOverride = layerOverride;
+        c.showLayerIndicator = showLayerIndicator;
+        c.caveSliceY = caveSliceY;
+        c.netherSliceY = netherSliceY;
+        c.dynamicLighting = dynamicLighting;
+        c.mapColorStyle = mapColorStyle;
+        c.mapQuality = mapQuality;
+        c.snapshotBudgetPerTick = snapshotBudgetPerTick;
+        c.gpuTileCacheLimit = gpuTileCacheLimit;
+        c.portalMarkersEnabled = portalMarkersEnabled;
+        c.portalIconsEnabled = portalIconsEnabled;
+        c.portalIconTextureNether = portalIconTextureNether;
+        c.portalIconTextureEnd = portalIconTextureEnd;
+        c.portalIconTextureGateway = portalIconTextureGateway;
+        c.portalIconSize = portalIconSize;
+        c.portalIconOpacity = portalIconOpacity;
+        c.portalChunkHighlightEnabled = portalChunkHighlightEnabled;
+        c.portalHighlightColor = portalHighlightColor;
+        c.portalIconHideZoom = portalIconHideZoom;
+        c.radarEnabled = radarEnabled;
+        c.radarDisplayMode = radarDisplayMode;
+        c.radarShowPlayers = radarShowPlayers;
+        c.radarShowHostile = radarShowHostile;
+        c.radarShowPassive = radarShowPassive;
+        c.radarShowOther = radarShowOther;
+        c.radarShowPlayerNames = radarShowPlayerNames;
+        c.radarAlwaysShowPlayerNames = radarAlwaysShowPlayerNames;
+        c.radarMaxEntities = radarMaxEntities;
+        c.radarPlayerIconOutlineEnabled = radarPlayerIconOutlineEnabled;
+        c.radarIconOutlineThickness = radarIconOutlineThickness;
+        c.radarIconSize = radarIconSize;
+        c.radarPlayerHighlightGhostSeconds = radarPlayerHighlightGhostSeconds;
+        c.waypointRenderDistance = waypointRenderDistance;
+        c.localWaypointsVisible = localWaypointsVisible;
+        c.sharedWaypointsVisible = sharedWaypointsVisible;
+        c.sharedWaypointCrossDimensionVisibleIds =
+            sharedWaypointCrossDimensionVisibleIds == null
+                ? new LinkedHashSet<>()
+                : new LinkedHashSet<>(sharedWaypointCrossDimensionVisibleIds);
+        c.sharedWaypointCrossDimensionYById =
+            sharedWaypointCrossDimensionYById == null
+                ? new LinkedHashMap<>()
+                : new LinkedHashMap<>(sharedWaypointCrossDimensionYById);
+        c.crossWorldWaypointsVisible = crossWorldWaypointsVisible;
+        c.crossWorldSeedObservations = crossWorldSeedObservations == null
+            ? new CrossWorldSeedObservations()
+            : crossWorldSeedObservations.copy();
+        c.waypointEdgeIndicatorsEnabled = waypointEdgeIndicatorsEnabled;
+        c.deathPointsKept = deathPointsKept;
+        c.waypointBeamsEnabled = waypointBeamsEnabled;
+        c.waypointLabelsEnabled = waypointLabelsEnabled;
+        c.waypointIconOpacity = waypointIconOpacity;
+        c.waypointHighlightDimOpacity = waypointHighlightDimOpacity;
+        c.highlightCrossDimensionVisible = highlightCrossDimensionVisible;
+        c.teleportCommand = teleportCommand;
+        c.teleportCloseMap = teleportCloseMap;
+        c.waypointListDefaultTab = waypointListDefaultTab;
+        c.waypointListDefaultDimension = waypointListDefaultDimension;
+        c.waypointLabelScalePercent = waypointLabelScalePercent;
+        c.predictionEnabled = predictionEnabled;
+        c.predictionNetworkSync = predictionNetworkSync;
+        c.predictionViewMode = predictionViewMode;
+        c.predictionShowStructures = predictionShowStructures;
+        c.predictionStructureIconHideZoom = predictionStructureIconHideZoom;
+        c.predictionStructureVisibility = predictionStructureVisibility == null
+            ? new StructureVisibilityConfig()
+            : predictionStructureVisibility.copy();
+        c.predictionManualSeeds = predictionManualSeeds == null
+            ? new ManualSeedConfig()
+            : predictionManualSeeds.copy();
+        c.predictionDebounceMs = predictionDebounceMs;
+        c.updateCheckEnabled = updateCheckEnabled;
+        c.unsupportedPlatformWarningDismissed = unsupportedPlatformWarningDismissed;
+        c.surveyReminderGameOpenMillis = surveyReminderGameOpenMillis;
+        c.surveyReminderNextPromptAtMillis = surveyReminderNextPromptAtMillis;
+        c.surveyReminderDismissed = surveyReminderDismissed;
+        return c;
+    }
+
+    public boolean isSharedWaypointCrossDimensionVisible(final UUID waypointId) {
+        return waypointId != null
+            && sharedWaypointCrossDimensionVisibleIds.contains(waypointId.toString());
+    }
+
+    public void setSharedWaypointCrossDimensionVisible(
+        final UUID waypointId,
+        final boolean visible
+    ) {
+        if (waypointId == null) {
+            return;
+        }
+        if (visible) {
+            sharedWaypointCrossDimensionVisibleIds.add(waypointId.toString());
+        } else {
+            sharedWaypointCrossDimensionVisibleIds.remove(waypointId.toString());
+        }
+    }
+
+    /** This client's Y override for the public waypoint, or null to keep its own Y. */
+    public Double sharedWaypointCrossDimensionY(final UUID waypointId) {
+        if (waypointId == null) {
+            return null;
+        }
+        return sharedWaypointCrossDimensionYById.get(waypointId.toString());
+    }
+
+    /** Stores (or clears with null) this client's Y override for the public waypoint. */
+    public void setSharedWaypointCrossDimensionY(final UUID waypointId, final Double y) {
+        if (waypointId == null) {
+            return;
+        }
+        if (y == null || !Double.isFinite(y)) {
+            sharedWaypointCrossDimensionYById.remove(waypointId.toString());
+        } else {
+            sharedWaypointCrossDimensionYById.put(waypointId.toString(), y);
+        }
+    }
+
+    /** Advances to the next minimap zoom level, wrapping after the final level. */
+    public void cycleMinimapZoom() {
+        minimapZoomIndex = (minimapZoomIndex + 1) % MINIMAP_ZOOM_LEVEL_COUNT;
+    }
+
+    /** Custom icon texture resource location for the portal kind; empty keeps the built-in default. */
+    public String portalIconTexture(final PortalKind kind) {
+        return switch (kind) {
+            case NETHER_PORTAL -> portalIconTextureNether;
+            case END_PORTAL -> portalIconTextureEnd;
+            case END_GATEWAY -> portalIconTextureGateway;
+        };
+    }
+
+    /** Stores (or clears with empty/null) the custom icon texture for the portal kind. */
+    public void setPortalIconTexture(final PortalKind kind, final String texture) {
+        final String trimmed = texture == null ? "" : texture.trim();
+        switch (kind) {
+            case NETHER_PORTAL -> portalIconTextureNether = trimmed;
+            case END_PORTAL -> portalIconTextureEnd = trimmed;
+            case END_GATEWAY -> portalIconTextureGateway = trimmed;
+        }
+    }
+
+    /** Clamp out-of-range values loaded from a hand-edited file. */
+    public void normalize() {
+        if (schemaVersion < 2) {
+            final MinimapPlacement.Position migrated = MinimapPlacement.fromLegacyCorner(minimapCorner);
+            minimapPositionX = migrated.x();
+            minimapPositionY = migrated.y();
+        }
+        minimapCorner = null;
+        final MinimapPlacement.Position position = MinimapPlacement.normalize(minimapPositionX, minimapPositionY);
+        minimapPositionX = position.x();
+        minimapPositionY = position.y();
+        if (minimapShape == null) {
+            minimapShape = Shape.SQUARE;
+        }
+        if (playerMarkerStyle == null) {
+            playerMarkerStyle = PlayerMarkerStyle.MODERN;
+        }
+        if (layerOverride == null) {
+            layerOverride = LayerOverride.AUTO;
+        }
+        if (waypointListDefaultTab == null) {
+            waypointListDefaultTab = WaypointListTab.LOCAL;
+        }
+        if (waypointListDefaultDimension == null) {
+            waypointListDefaultDimension = WaypointListDefaultDimension.CURRENT;
+        }
+        if (fullscreenDisplayMode == null) {
+            fullscreenDisplayMode = FullscreenDisplayMode.TERRAIN;
+        }
+        if (chunkLoadDetailMode == null) {
+            chunkLoadDetailMode = ChunkLoadDetailMode.BANDS;
+        }
+        if (mapColorStyle == null) {
+            mapColorStyle = MapColorStyle.CONFLUX;
+        }
+        if (mapQuality == null) {
+            mapQuality = MapQuality.BALANCED;
+        }
+        if (radarDisplayMode == null) {
+            radarDisplayMode = RadarDisplayMode.PORTRAITS;
+        }
+        if (sharedWaypointCrossDimensionVisibleIds == null) {
+            sharedWaypointCrossDimensionVisibleIds = new LinkedHashSet<>();
+        }
+        if (sharedWaypointCrossDimensionYById == null) {
+            sharedWaypointCrossDimensionYById = new LinkedHashMap<>();
+        }
+        sharedWaypointCrossDimensionYById.values().removeIf(
+            y -> y == null || !Double.isFinite(y)
+        );
+        if (schemaVersion < 3 && playerTrailDurationMinutes != null) {
+            final long legacyDurationSeconds = playerTrailDurationMinutes.longValue() * 60L;
+            playerTrailDurationSeconds = (int) Math.max(
+                MIN_PLAYER_TRAIL_DURATION_SECONDS,
+                Math.min(MAX_PLAYER_TRAIL_DURATION_SECONDS, legacyDurationSeconds)
+            );
+        }
+        playerTrailDurationMinutes = null;
+        if (schemaVersion < 10 && playerTrailDurationSeconds == LEGACY_PLAYER_TRAIL_DURATION_SECONDS) {
+            // Schema v9 shipped 120 s as the default; only that exact value collapses.
+            // The clamp below still maps out-of-range values to the 120 s maximum.
+            playerTrailDurationSeconds = DEFAULT_PLAYER_TRAIL_DURATION_SECONDS;
+        }
+        minimapSize = clamp(minimapSize, 64, 256);
+        minimapZoomIndex = clamp(minimapZoomIndex, 0, MINIMAP_ZOOM_LEVEL_COUNT - 1);
+        playerTrailDurationSeconds = clamp(
+            playerTrailDurationSeconds,
+            MIN_PLAYER_TRAIL_DURATION_SECONDS,
+            MAX_PLAYER_TRAIL_DURATION_SECONDS
+        );
+        playerTrailDotSize = clamp(
+            playerTrailDotSize,
+            MIN_PLAYER_TRAIL_DOT_SIZE,
+            MAX_PLAYER_TRAIL_DOT_SIZE
+        );
+        annotationEraserSize = clamp(
+            annotationEraserSize, MIN_ANNOTATION_ERASER_SIZE, MAX_ANNOTATION_ERASER_SIZE
+        );
+        caveSliceY = clamp(caveSliceY, 0, 255);
+        netherSliceY = clamp(netherSliceY, 0, 127);
+        snapshotBudgetPerTick = clamp(snapshotBudgetPerTick, 1, 64);
+        gpuTileCacheLimit = clamp(gpuTileCacheLimit, 16, 2048);
+        radarMaxEntities = clamp(radarMaxEntities, 1, 500);
+        radarIconSize = clamp(radarIconSize, MIN_RADAR_ICON_SIZE, MAX_RADAR_ICON_SIZE);
+        radarIconOutlineThickness = clamp(
+            radarIconOutlineThickness,
+            MIN_RADAR_ICON_OUTLINE_THICKNESS,
+            MAX_RADAR_ICON_OUTLINE_THICKNESS
+        );
+        radarPlayerHighlightGhostSeconds = clamp(
+            radarPlayerHighlightGhostSeconds,
+            MIN_RADAR_PLAYER_HIGHLIGHT_GHOST_SECONDS,
+            MAX_RADAR_PLAYER_HIGHLIGHT_GHOST_SECONDS
+        );
+        waypointRenderDistance = clamp(waypointRenderDistance, 0, 100_000);
+        waypointLabelScalePercent = clamp(
+            waypointLabelScalePercent,
+            MIN_WAYPOINT_LABEL_SCALE_PERCENT, MAX_WAYPOINT_LABEL_SCALE_PERCENT
+        );
+        if (schemaVersion < 11 && LEGACY_TELEPORT_COMMAND.equals(teleportCommand)) {
+            // Schema v10 shipped "tp {x} {y} {z}" as the default; only that exact value
+            // upgrades to the cross-dimension default, so a deliberate copy stays put.
+            teleportCommand = DEFAULT_TELEPORT_COMMAND;
+        }
+        if (!TeleportCommandTemplate.valid(teleportCommand)) {
+            teleportCommand = DEFAULT_TELEPORT_COMMAND;
+        }
+        deathPointsKept = clamp(deathPointsKept, 0, 50);
+        waypointIconOpacity = clamp(
+            waypointIconOpacity, MIN_WAYPOINT_ICON_OPACITY, MAX_WAYPOINT_ICON_OPACITY
+        );
+        waypointHighlightDimOpacity = clamp(
+            waypointHighlightDimOpacity,
+            MIN_WAYPOINT_HIGHLIGHT_DIM_OPACITY,
+            MAX_WAYPOINT_HIGHLIGHT_DIM_OPACITY
+        );
+        portalIconSize = clamp(portalIconSize, MIN_PORTAL_ICON_SIZE, MAX_PORTAL_ICON_SIZE);
+        portalIconOpacity = clamp(portalIconOpacity, MIN_PORTAL_ICON_OPACITY, MAX_PORTAL_ICON_OPACITY);
+        portalIconHideZoom = clamp(
+            portalIconHideZoom,
+            MIN_PORTAL_ICON_HIDE_ZOOM,
+            MAX_PORTAL_ICON_HIDE_ZOOM
+        );
+        if (portalHighlightColor == null) {
+            portalHighlightColor = PortalHighlightColor.PURPLE;
+        }
+        portalIconTextureNether = normalizeIconTexture(portalIconTextureNether);
+        portalIconTextureEnd = normalizeIconTexture(portalIconTextureEnd);
+        portalIconTextureGateway = normalizeIconTexture(portalIconTextureGateway);
+        if (predictionViewMode == null) {
+            predictionViewMode = PredictionViewMode.EVERYWHERE;
+        }
+        if (schemaVersion < 4 && predictionStructureMaxLod != null) {
+            final int legacyLod = clamp(predictionStructureMaxLod, 0, TileMath.MAX_LOD);
+            predictionStructureIconHideZoom = legacyLod == TileMath.MAX_LOD
+                ? 0.0
+                : 1.0 / TileMath.blocksPerPixel(legacyLod + 1);
+        } else if (schemaVersion < 5 && predictionStructureIconHideScale != null) {
+            // Schema v4 stored blocks per pixel and normalized this value before use.
+            // Clamp first so hand-edited v4 files retain their old effective behavior.
+            final double legacyScale = clamp(
+                predictionStructureIconHideScale,
+                LEGACY_MIN_PREDICTION_STRUCTURE_ICON_HIDE_SCALE,
+                LEGACY_MAX_PREDICTION_STRUCTURE_ICON_HIDE_SCALE
+            );
+            predictionStructureIconHideZoom = 1.0 / legacyScale;
+        }
+        predictionStructureMaxLod = null;
+        predictionStructureIconHideScale = null;
+        predictionStructureIconHideZoom = clamp(
+            predictionStructureIconHideZoom,
+            MIN_PREDICTION_STRUCTURE_ICON_HIDE_ZOOM,
+            MAX_PREDICTION_STRUCTURE_ICON_HIDE_ZOOM
+        );
+        if (predictionStructureVisibility == null) {
+            predictionStructureVisibility = new StructureVisibilityConfig();
+        } else {
+            predictionStructureVisibility.normalize();
+        }
+        if (predictionManualSeeds == null) {
+            predictionManualSeeds = new ManualSeedConfig();
+        } else {
+            predictionManualSeeds.normalize();
+        }
+        if (crossWorldSeedObservations == null) {
+            crossWorldSeedObservations = new CrossWorldSeedObservations();
+        } else {
+            crossWorldSeedObservations.normalize();
+        }
+        predictionDebounceMs = clamp(predictionDebounceMs, 100, 2000);
+        surveyReminderGameOpenMillis = Math.max(0L, surveyReminderGameOpenMillis);
+        if (surveyReminderNextPromptAtMillis <= 0L) {
+            surveyReminderNextPromptAtMillis = SurveyReminderSchedule.FIRST_DELAY_MILLIS;
+        }
+    }
+
+    private static int clamp(final int v, final int min, final int max) {
+        return Math.max(min, Math.min(max, v));
+    }
+    private static double clamp(final double value, final double min, final double max) {
+        return Double.isFinite(value) ? Math.max(min, Math.min(max, value)) : min;
+    }
+
+    /** Null-safe trim for hand-edited icon texture fields; empty means the built-in default. */
+    private static String normalizeIconTexture(final String texture) {
+        return texture == null ? "" : texture.trim();
+    }
+}

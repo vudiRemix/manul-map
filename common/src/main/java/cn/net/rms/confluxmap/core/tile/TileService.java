@@ -1,0 +1,1644 @@
+package cn.net.rms.confluxmap.core.tile;
+
+import cn.net.rms.confluxmap.core.cache.RegionCacheService;
+import cn.net.rms.confluxmap.core.cache.RegionDiskCache;
+import cn.net.rms.confluxmap.core.color.BiomeColorPalette;
+import cn.net.rms.confluxmap.core.color.DaylightModel;
+import cn.net.rms.confluxmap.core.color.LightTint;
+import cn.net.rms.confluxmap.core.color.MapColorStyle;
+import cn.net.rms.confluxmap.core.color.ShadingPipeline;
+import cn.net.rms.confluxmap.core.color.XaeroMapStyle;
+import cn.net.rms.confluxmap.core.config.ConfluxConfig;
+import cn.net.rms.confluxmap.core.model.ChunkSnapshot;
+import cn.net.rms.confluxmap.core.model.DimensionId;
+import cn.net.rms.confluxmap.core.model.MapLayer;
+import cn.net.rms.confluxmap.core.model.SurfaceKind;
+import cn.net.rms.confluxmap.core.model.TileKey;
+import cn.net.rms.confluxmap.core.net.CorrectionProfile;
+import cn.net.rms.confluxmap.core.net.PatchCodec;
+import cn.net.rms.confluxmap.core.predict.CorrectionTile;
+import cn.net.rms.confluxmap.core.predict.MapSourceSelector;
+import cn.net.rms.confluxmap.core.predict.PredictedTileKeys;
+import cn.net.rms.confluxmap.core.store.ColumnStore;
+import cn.net.rms.confluxmap.core.store.MapWorld;
+import cn.net.rms.confluxmap.core.store.MapWorldService;
+import cn.net.rms.confluxmap.core.store.RegionColumns;
+import cn.net.rms.confluxmap.core.task.MapExecutors;
+import cn.net.rms.confluxmap.core.task.SessionGuard;
+import cn.net.rms.confluxmap.core.util.Argb;
+import cn.net.rms.confluxmap.core.util.ChunkViewport;
+import cn.net.rms.confluxmap.core.util.TileMath;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CancellationException;
+import java.util.function.Consumer;
+import java.util.function.Predicate;
+
+/**
+ * Owns the dirty-tile composition queue and the bounded render-thread upload
+ * queue. Composition itself runs on {@link MapExecutors#workers()}; only
+ * {@link #drainUploads(int)} is meant to be called from the render thread.
+ *
+ * <p>{@link TileKey#layerId()} carries which {@link MapLayer} a tile belongs to ({@link
+ * MapLayer#parse} recovers it); every layer shares this one composition path. Fine-region
+ * invalidations are merged per tile and recomposed incrementally. Visible work keeps top-left
+ * row-major submission priority while using the full worker pool.
+ */
+public final class TileService {
+    private static final int UPLOAD_QUEUE_CAPACITY = 64;
+    private static final int VIEWPORT_REGION_LOAD_ATTEMPTS = 128;
+    private static final ThreadLocal<ComposeScratch> COMPOSE_SCRATCH =
+        ThreadLocal.withInitial(ComposeScratch::new);
+
+    private final MapWorldService mapWorlds;
+    private final MapExecutors executors;
+    private final ConfluxConfig config;
+    private final DaylightModel daylightModel;
+    private final int maxConcurrentCompositions;
+
+    /** Guarded by {@code this}: tiles waiting to be composed and the fine regions that changed. */
+    private final Map<TileKey, DirtyWork> dirty = new HashMap<>();
+    /** Guarded by {@code this}: tiles currently being composed on a worker. */
+    private final Set<TileKey> inFlight = new HashSet<>();
+    /**
+     * Guarded by {@code this}: tiles the renderer has asked for at least once and has not
+     * reported dropping. A tile outside this set has no texture to keep fresh, so invalidating
+     * it would compose pixels nobody is looking at - and a coarse tile costs one full compose
+     * per LOD-0 region it covers (256 of them at LOD4), per captured chunk.
+     */
+    private final Set<TileKey> requestedTiles = new HashSet<>();
+    /**
+     * Guarded by {@code this}: requested tiles that changed while off screen. Recomposing them
+     * where they are is wasted work at any LOD the viewer is not currently on; {@link
+     * #setViewport} promotes them back into {@link #dirty} when they come into view.
+     */
+    private final Set<TileKey> staleTiles = new HashSet<>();
+
+    /** Guarded by {@code this}: bounded upload queue with partial updates merged per key. */
+    private final LinkedHashMap<TileKey, TileUpdate> uploads = new LinkedHashMap<>();
+
+    /** Latest fullscreen viewport. Visible requests use deterministic top-left row-major order. */
+    private ViewportRect viewport;
+    /** Next LOD-0 region in the current viewport to offer to the bounded disk-load queue. */
+    private long viewportRegionLoadCursor;
+    /** Invalidates a composition that started before a global rendering-input change. Guarded by this. */
+    private long compositionGeneration;
+
+    private volatile int viewpointX;
+    private volatile int viewpointZ;
+
+    /**
+     * Late-bound instead of a constructor parameter: {@link RegionCacheService} itself needs a
+     * {@link TileService} reference (to mark tiles dirty after a disk-cache merge), so the two
+     * can't both take each other as constructor arguments. The composition root wires this once
+     * after constructing both.
+     */
+    private volatile RegionCacheService regionCache;
+    private volatile Consumer<TileKey> realCoverageListener = ignored -> { };
+    private volatile Consumer<TileKey> predictedUploadReloader = ignored -> { };
+    private volatile ChunkViewport localAuthorityViewport;
+
+    public TileService(
+        final MapWorldService mapWorlds,
+        final MapExecutors executors,
+        final ConfluxConfig config,
+        final DaylightModel daylightModel
+    ) {
+        this.mapWorlds = mapWorlds;
+        this.executors = executors;
+        this.config = config;
+        this.daylightModel = daylightModel;
+        this.maxConcurrentCompositions = Math.max(1, executors.workerCount());
+    }
+
+    public void bindRegionCache(final RegionCacheService regionCache) {
+        this.regionCache = regionCache;
+    }
+
+    /** Registers the prediction-plane invalidator for newly available real-map coverage. */
+    public void bindRealCoverageListener(final Consumer<TileKey> listener) {
+        realCoverageListener = listener == null ? ignored -> { } : listener;
+    }
+
+    /**
+     * Registers the composer to ask for a predicted tile again after {@link #pushUpload} had to
+     * evict its pending upload. This class can only recompose the tiles it owns; a {@code "!pred"}
+     * key belongs to the prediction plane, and dropping its update without telling anyone would
+     * strand whatever pixels that tile last managed to upload.
+     */
+    public void bindPredictedUploadReloader(final Consumer<TileKey> reloader) {
+        predictedUploadReloader = reloader == null ? ignored -> { } : reloader;
+    }
+
+    /** Publishes the server send-distance snapshot used for local source authority. */
+    public void setLocalAuthorityViewport(final ChunkViewport viewport) {
+        localAuthorityViewport = viewport;
+    }
+
+    /** Main thread, from the session tracker: forget every queued/in-flight tile and pending upload. */
+    public void onSessionChanged(final SessionGuard.Session session) {
+        synchronized (this) {
+            dirty.clear();
+            inFlight.clear();
+            requestedTiles.clear();
+            staleTiles.clear();
+            uploads.clear();
+            viewport = null;
+            viewportRegionLoadCursor = 0L;
+        }
+        localAuthorityViewport = null;
+    }
+
+    /** Where the viewer currently is, for dirty-tile composition priority. */
+    public void setViewpoint(final int blockX, final int blockZ) {
+        viewpointX = blockX;
+        viewpointZ = blockZ;
+    }
+
+    /**
+     * Main thread: tells the composer which tiles the fullscreen map is about to request. Requests
+     * inside this rectangle are started from the top-left, left-to-right, then top-to-bottom.
+     */
+    public void setViewport(
+        final MapLayer layer,
+        final int lod,
+        final int minTileX,
+        final int maxTileX,
+        final int minTileZ,
+        final int maxTileZ
+    ) {
+        final ViewportRect next = new ViewportRect(layer.type(), lod, minTileX, maxTileX, minTileZ, maxTileZ);
+        final MapWorld world = mapWorlds.current();
+        final long token = world == null ? 0L : world.session().token();
+        synchronized (this) {
+            if (!next.equals(viewport)) {
+                viewportRegionLoadCursor = 0L;
+                if (world != null) {
+                    promoteStale(next, token);
+                }
+            }
+            viewport = next;
+        }
+        scheduleViewportRegionLoads(next);
+        pump();
+    }
+
+    /**
+     * Caller must hold the monitor: queues every off-screen tile that changed while the viewer
+     * was elsewhere and that {@code next} is about to show. This is what keeps a zoom level the
+     * viewer left and came back to from drawing the map as it looked when they left it.
+     */
+    private void promoteStale(final ViewportRect next, final long token) {
+        staleTiles.removeIf(key -> {
+            if (!next.contains(key)) {
+                return false;
+            }
+            dirty.merge(key, DirtyWork.full(token), DirtyWork::merge);
+            return true;
+        });
+    }
+
+    /** Clears fullscreen ordering after the screen closes so minimap requests return to distance priority. */
+    public void clearViewport() {
+        synchronized (this) {
+            viewport = null;
+            viewportRegionLoadCursor = 0L;
+        }
+        pump();
+    }
+
+    /**
+     * Returns a fully recomposed CPU tile for non-render consumers such as PNG export. Persistent
+     * backing regions are loaded first, one at a time, so an arbitrarily large export neither
+     * replaces the visible viewport nor floods the bounded disk queue.
+     */
+    public CompletableFuture<int[]> snapshotTile(
+        final TileKey key,
+        final boolean dynamicLighting,
+        final float daylightFactor
+    ) {
+        final MapWorld world = mapWorlds.current();
+        if (world == null
+            || !key.world().equals(world.session().world())
+            || !key.dimension().equals(world.session().dimension())) {
+            return CompletableFuture.failedFuture(new CancellationException("Map session changed"));
+        }
+        final long token = world.session().token();
+        final MapLayer layer = MapLayer.parse(BiomeTileKeys.realLayerId(key.layerId()));
+        final RegionDiskCache cache = regionCache == null ? null : regionCache.current();
+        final CompletableFuture<Void> loaded;
+        if (cache != null && layer.type().persistent()) {
+            final int regionsPerSide = 1 << key.lod();
+            final int baseRegionX = key.tileX() << key.lod();
+            final int baseRegionZ = key.tileZ() << key.lod();
+            loaded = cache.awaitRegionsLoaded(
+                layer.type(), baseRegionX, baseRegionZ, regionsPerSide
+            );
+        } else {
+            loaded = CompletableFuture.completedFuture(null);
+        }
+        final CompletableFuture<int[]> composed = loaded.thenApplyAsync(ignored -> {
+            final TileUpdate update = composeTile(
+                key, token, dynamicLighting, daylightFactor, daylightModel.state().gamma()
+            );
+            if (update == null) {
+                throw new CancellationException("Map session changed");
+            }
+            return update.argbPixels();
+        }, executors.workers());
+        final CompletableFuture<int[]> result = new CompletableFuture<>();
+        composed.whenComplete((pixels, error) -> {
+            if (error == null) {
+                result.complete(pixels);
+            } else {
+                result.completeExceptionally(error);
+            }
+        });
+        result.whenComplete((ignored, error) -> {
+            if (result.isCancelled()) {
+                loaded.cancel(true);
+                composed.cancel(true);
+            }
+        });
+        return result;
+    }
+
+    /**
+     * Called by the capture pipeline after a chunk was newly stored. Marks the tile covering
+     * that chunk dirty at every LOD. When the chunk touches a tile edge, every
+     * adjacent tile whose symmetric one-pixel relief stencil consumes that edge is included too.
+     * Interior chunks still invalidate exactly one tile per LOD.
+     */
+    public void markChunkStored(
+        final long token,
+        final DimensionId dimensionId,
+        final MapLayer layer,
+        final int chunkX,
+        final int chunkZ
+    ) {
+        final MapWorld world = mapWorlds.ifCurrent(token);
+        if (world == null) {
+            return;
+        }
+        markChunksStored(
+            token, dimensionId, layer, List.of(new RegionUnit(chunkX, chunkZ))
+        );
+    }
+
+    /**
+     * Disk-cache counterpart of {@link #markChunkStored}: one region read may merge up to 256
+     * chunks, so invalidate its affected fine-region rectangles once instead of issuing the same
+     * parent keys 256 times. Relief consumers in all eight neighboring regions are included.
+     */
+    public void markRegionStored(
+        final long token,
+        final DimensionId dimensionId,
+        final MapLayer layer,
+        final int regionX,
+        final int regionZ
+    ) {
+        markRegionsStored(
+            token, dimensionId, layer, List.of(new RegionUnit(regionX, regionZ))
+        );
+    }
+
+    /** Batch counterpart of {@link #markChunkStored}; all invalidations are merged before pumping. */
+    public void markChunksStored(
+        final long token,
+        final DimensionId dimensionId,
+        final MapLayer layer,
+        final List<RegionUnit> chunks
+    ) {
+        final MapWorld world = mapWorlds.ifCurrent(token);
+        if (world == null || chunks.isEmpty()) {
+            return;
+        }
+        final SessionGuard.Session session = world.session();
+        final Set<TileKey> coverage = new HashSet<>();
+        synchronized (this) {
+            for (final RegionUnit chunk : chunks) {
+                markChunkConsumers(
+                    session, dimensionId, layer, chunk.x, chunk.z, token, coverage
+                );
+            }
+        }
+        coverage.forEach(realCoverageListener);
+        pump();
+    }
+
+    /** Batch counterpart of {@link #markRegionStored}; all invalidations are merged before pumping. */
+    public void markRegionsStored(
+        final long token,
+        final DimensionId dimensionId,
+        final MapLayer layer,
+        final List<RegionUnit> regions
+    ) {
+        final MapWorld world = mapWorlds.ifCurrent(token);
+        if (world == null || regions.isEmpty()) {
+            return;
+        }
+        final SessionGuard.Session session = world.session();
+        final Set<TileKey> coverage = new HashSet<>();
+        synchronized (this) {
+            for (final RegionUnit region : regions) {
+                markRegionConsumers(
+                    session, dimensionId, layer, region.x, region.z, token, coverage
+                );
+            }
+        }
+        coverage.forEach(realCoverageListener);
+        pump();
+    }
+
+    /** Integer coordinate pair used by batch invalidation entry points. */
+    public record RegionUnit(int x, int z) {
+    }
+
+    /**
+     * Clears predicted pixels whose exact block footprint belongs to a real cached/live chunk.
+     * Every supported LOD remains chunk-aligned: LOD0 has 16 pixels per chunk and LOD4 has one.
+     */
+    public void maskKnownRealPixels(final TileKey realKey, final int[] predictedPixels) {
+        maskPredictedPixels(
+            realKey, predictedPixels, null, CorrectionProfile.LEGACY_V1
+        );
+    }
+
+    /** Keeps prediction below available real sources while allowing newer synchronized chunks through. */
+    public void maskPredictedPixels(
+        final TileKey realKey,
+        final int[] predictedPixels,
+        final CorrectionTile corrections,
+        final CorrectionProfile profile
+    ) {
+        maskPredictedPixels(
+            realKey,
+            predictedPixels,
+            corrections == null ? null : corrections.copyEvaluated(),
+            corrections == null ? null : corrections.copyPixelSourceRevisions(),
+            profile
+        );
+    }
+
+    public void maskPredictedPixels(
+        final TileKey realKey,
+        final int[] predictedPixels,
+        final byte[] syncEvaluated,
+        final long[] syncSourceRevisions,
+        final CorrectionProfile profile
+    ) {
+        if (predictedPixels.length != RegionColumns.SIZE * RegionColumns.SIZE) {
+            throw new IllegalArgumentException("predictedPixels must contain one 256x256 tile");
+        }
+        if (syncEvaluated != null && syncEvaluated.length != PatchCodec.MASK_BYTES) {
+            throw new IllegalArgumentException("sync evaluated mask has the wrong length");
+        }
+        if (syncSourceRevisions != null
+            && syncSourceRevisions.length != RegionColumns.SIZE * RegionColumns.SIZE) {
+            throw new IllegalArgumentException("sync source revisions have the wrong length");
+        }
+        final MapWorld world = mapWorlds.current();
+        if (world == null
+            || !realKey.world().equals(world.session().world())
+            || !realKey.dimension().equals(world.session().dimension())) {
+            return;
+        }
+        final MapLayer layer = MapLayer.parse(BiomeTileKeys.realLayerId(realKey.layerId()));
+        final ColumnStore store = world.store(layer);
+        final int chunksPerTile = 16 << realKey.lod();
+        final int pixelsPerChunk = 16 >> realKey.lod();
+        final int baseChunkX = realKey.tileX() * chunksPerTile;
+        final int baseChunkZ = realKey.tileZ() * chunksPerTile;
+        for (int chunkDz = 0; chunkDz < chunksPerTile; chunkDz++) {
+            for (int chunkDx = 0; chunkDx < chunksPerTile; chunkDx++) {
+                final int chunkX = baseChunkX + chunkDx;
+                final int chunkZ = baseChunkZ + chunkDz;
+                final ChunkViewport localViewport = localAuthorityViewport;
+                final boolean locallyAuthoritative = localViewport != null
+                    && localViewport.contains(chunkX, chunkZ);
+                final boolean localPresent = store.hasRealChunk(chunkX, chunkZ);
+                if (!localPresent) {
+                    continue;
+                }
+                final long localRevision = localPresent
+                    ? store.realChunkSourceRevision(chunkX, chunkZ)
+                    : MapSourceSelector.UNKNOWN_REVISION;
+                final int pixelX = chunkDx * pixelsPerChunk;
+                final int pixelZ = chunkDz * pixelsPerChunk;
+                for (int dz = 0; dz < pixelsPerChunk; dz++) {
+                    final int row = (pixelZ + dz) * RegionColumns.SIZE;
+                    for (int dx = 0; dx < pixelsPerChunk; dx++) {
+                        final int pixel = row + pixelX + dx;
+                        final boolean syncPresent = syncEvaluated != null
+                            && (syncEvaluated[pixel >>> 3] & (1 << (pixel & 7))) != 0;
+                        final long syncRevision = syncPresent && syncSourceRevisions != null
+                            ? syncSourceRevisions[pixel]
+                            : MapSourceSelector.UNKNOWN_REVISION;
+                        if (locallyAuthoritative || !MapSourceSelector.syncWins(
+                            localPresent, localRevision, syncPresent, syncRevision, profile
+                        )) {
+                            predictedPixels[pixel] = Argb.TRANSPARENT;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private void markChunkConsumers(
+        final SessionGuard.Session session,
+        final DimensionId dimensionId,
+        final MapLayer layer,
+        final int chunkX,
+        final int chunkZ,
+        final long token,
+        final Set<TileKey> coverage
+    ) {
+        final int regionX = Math.floorDiv(chunkX, RegionColumns.CHUNKS);
+        final int regionZ = Math.floorDiv(chunkZ, RegionColumns.CHUNKS);
+        final int localX = Math.floorMod(chunkX, RegionColumns.CHUNKS);
+        final int localZ = Math.floorMod(chunkZ, RegionColumns.CHUNKS);
+        final int minDx = localX == 0 ? -1 : 0;
+        final int maxDx = localX == RegionColumns.CHUNKS - 1 ? 1 : 0;
+        final int minDz = localZ == 0 ? -1 : 0;
+        final int maxDz = localZ == RegionColumns.CHUNKS - 1 ? 1 : 0;
+        for (int lod = 0; lod <= TileMath.MAX_LOD; lod++) {
+            for (int dz = minDz; dz <= maxDz; dz++) {
+                for (int dx = minDx; dx <= maxDx; dx++) {
+                    markDirtyChunkRegion(
+                        tileKey(session, dimensionId, layer, lod, regionX + dx, regionZ + dz),
+                        token, chunkX, chunkZ, regionX + dx, regionZ + dz
+                    );
+                }
+            }
+            final TileKey center = tileKey(
+                session, dimensionId, layer, lod, regionX, regionZ
+            );
+            markDirtyChunkRegion(
+                BiomeTileKeys.toBiome(center), token, chunkX, chunkZ, regionX, regionZ
+            );
+            coverage.add(center);
+        }
+    }
+
+    private void markRegionConsumers(
+        final SessionGuard.Session session,
+        final DimensionId dimensionId,
+        final MapLayer layer,
+        final int regionX,
+        final int regionZ,
+        final long token,
+        final Set<TileKey> coverage
+    ) {
+        for (int lod = 0; lod <= TileMath.MAX_LOD; lod++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    markDirtyRegion(
+                        tileKey(session, dimensionId, layer, lod, regionX + dx, regionZ + dz),
+                        token, regionX + dx, regionZ + dz
+                    );
+                }
+            }
+            final TileKey center = tileKey(
+                session, dimensionId, layer, lod, regionX, regionZ
+            );
+            markDirtyRegion(BiomeTileKeys.toBiome(center), token, regionX, regionZ);
+            coverage.add(center);
+        }
+    }
+
+    private static TileKey tileKey(
+        final SessionGuard.Session session,
+        final DimensionId dimensionId,
+        final MapLayer layer,
+        final int lod,
+        final int regionX,
+        final int regionZ
+    ) {
+        return new TileKey(
+            session.world(), dimensionId, layer.cacheId(), lod,
+            Math.floorDiv(regionX, 1 << lod), Math.floorDiv(regionZ, 1 << lod)
+        );
+    }
+
+    /**
+     * Called (from {@code mc.world.McDaylightTracker}) whenever {@link DaylightModel}'s
+     * quantized bucket changes: marks every currently-resident SURFACE-layer tile dirty -
+     * the LOD-0 tile of each region already in the {@link ColumnStore}, plus the covering
+     * tile at every higher LOD (deduped by the {@link #dirty} map, since many regions share
+     * one coarse tile) - so all of them recompose with the new day/night + block-light blend.
+     * Without the higher LODs the zoomed-out fullscreen map would keep showing whatever
+     * daylight its tiles were last composed with while the LOD-0 minimap moved on. Uses the
+     * existing dirty-queue prioritization/budget (see {@link #pump}), so this never stalls
+     * the queue even for a large resident set - it only fires on a slow drift (a few dozen
+     * times per full day/night cycle), not per-frame.
+     */
+    public void markSurfaceRelit(final long token) {
+        final MapWorld world = mapWorlds.ifCurrent(token);
+        if (world == null) {
+            return;
+        }
+        final SessionGuard.Session session = world.session();
+        final ColumnStore store = world.store(MapLayer.SURFACE);
+        for (final RegionColumns region : store.allRegions()) {
+            for (int lod = 0; lod <= TileMath.MAX_LOD; lod++) {
+                final TileKey key = new TileKey(
+                    session.world(), session.dimension(), MapLayer.SURFACE.cacheId(), lod,
+                    region.regionX >> lod, region.regionZ >> lod
+                );
+                markDirty(key, token);
+            }
+        }
+    }
+
+    /** Drops queued old-style results; released textures request fresh compositions next frame. */
+    public synchronized void reloadMapColorStyle() {
+        invalidateCompositions();
+    }
+
+    /** Drops results composed with an obsolete global light state. */
+    public synchronized void reloadLighting() {
+        invalidateCompositions();
+    }
+
+    private void invalidateCompositions() {
+        compositionGeneration++;
+        dirty.clear();
+        staleTiles.clear();
+        uploads.clear();
+    }
+
+    /** For a tile that's visible but has never been composed (or requested again after being evicted). */
+    public void requestTile(final TileKey key) {
+        final MapWorld world = mapWorlds.current();
+        if (world == null) {
+            return;
+        }
+        final SessionGuard.Session session = world.session();
+        if (!key.world().equals(session.world()) || !key.dimension().equals(session.dimension())) {
+            return;
+        }
+        synchronized (this) {
+            requestedTiles.add(key);
+            staleTiles.remove(key);
+            // A missing texture is checked once per rendered frame. Do not turn that repeated
+            // check into an invalidation loop while the same tile is already queued or composing.
+            if (dirty.containsKey(key) || inFlight.contains(key)) {
+                return;
+            }
+            dirty.merge(key, DirtyWork.full(session.token()), DirtyWork::merge);
+        }
+        pump();
+        // A viewport proactively schedules every covered region at higher LODs. Keep this direct
+        // LOD0 touch for callers that request a tile without first publishing a viewport.
+        if (key.lod() == 0) {
+            final MapLayer.Type layerType = MapLayer.parse(
+                BiomeTileKeys.realLayerId(key.layerId())
+            ).type();
+            if (layerType.persistent()) {
+                requestRegionLoad(layerType, key.tileX(), key.tileZ());
+            }
+        }
+    }
+
+    /**
+     * Render thread: the texture for {@code key} is gone (LRU eviction or a session release), so
+     * this service has nothing to keep fresh for it any more. Keeping the key would leave every
+     * later capture recomposing a tile whose pixels have no home; {@code bind} composes it in
+     * full again the next time it is actually drawn.
+     */
+    public synchronized void forgetTile(final TileKey key) {
+        requestedTiles.remove(key);
+        staleTiles.remove(key);
+    }
+
+    /**
+     * Render thread: {@code key} has a texture again. Normally {@link #requestTile} already said
+     * so, but an upload composed before an eviction can land after it - and a tile the renderer
+     * holds while this service has forgotten it is exactly the tile that would freeze on screen,
+     * since {@code bind} only re-requests a texture that is missing outright.
+     */
+    public synchronized void retainTile(final TileKey key) {
+        requestedTiles.add(key);
+    }
+
+    private void requestRegionLoad(final MapLayer.Type layerType, final int regionX, final int regionZ) {
+        final RegionCacheService cacheService = regionCache;
+        if (cacheService == null) {
+            return;
+        }
+        final RegionDiskCache cache = cacheService.current();
+        if (cache != null) {
+            cache.ensureRegionLoaded(layerType, regionX, regionZ);
+        }
+    }
+
+    /**
+     * Offers a bounded row-major slice of the coarse viewport's LOD-0 regions to the disk cache.
+     * The cache has its own pending-read cap; when full, the cursor stays put and the next rendered
+     * frame retries. Already accepted regions are session-deduped by {@link RegionDiskCache}.
+     */
+    private void scheduleViewportRegionLoads(final ViewportRect active) {
+        if (!active.layerType().persistent()) {
+            return;
+        }
+        final RegionCacheService cacheService = regionCache;
+        final RegionDiskCache cache = cacheService == null ? null : cacheService.current();
+        if (cache == null) {
+            return;
+        }
+        final long tileWidth = (long) active.maxTileX() - active.minTileX() + 1L;
+        final long tileHeight = (long) active.maxTileZ() - active.minTileZ() + 1L;
+        if (tileWidth <= 0L || tileHeight <= 0L) {
+            return;
+        }
+        final int regionsPerTile = 1 << active.lod();
+        final long regionsPerTileSquared = (long) regionsPerTile * regionsPerTile;
+        final long total = tileWidth * tileHeight * regionsPerTileSquared;
+        final long cursor;
+        synchronized (this) {
+            if (!active.equals(viewport) || viewportRegionLoadCursor >= total) {
+                return;
+            }
+            cursor = viewportRegionLoadCursor;
+        }
+        final int offered = (int) Math.min(
+            VIEWPORT_REGION_LOAD_ATTEMPTS, total - cursor
+        );
+        final List<RegionUnit> regions = new ArrayList<>(offered);
+        for (int offset = 0; offset < offered; offset++) {
+            final long index = cursor + offset;
+            final long tileIndex = index / regionsPerTileSquared;
+            final int regionIndex = (int) (index % regionsPerTileSquared);
+            final int tileX = active.minTileX() + (int) (tileIndex % tileWidth);
+            final int tileZ = active.minTileZ() + (int) (tileIndex / tileWidth);
+            final int regionX = tileX * regionsPerTile + regionIndex % regionsPerTile;
+            final int regionZ = tileZ * regionsPerTile + regionIndex / regionsPerTile;
+            regions.add(new RegionUnit(regionX, regionZ));
+        }
+        final int accepted = cache.ensureRegionsLoadedAsync(
+            active.layerType(), regions
+        ).size();
+        synchronized (this) {
+            if (active.equals(viewport) && viewportRegionLoadCursor == cursor) {
+                viewportRegionLoadCursor += accepted;
+            }
+        }
+    }
+
+    /**
+     * Queues a recompose for a tile that already exists on screen or in the texture cache.
+     *
+     * <p>Two gates decide whether the work is worth doing at all. A tile the renderer has never
+     * requested has no texture to keep fresh: {@code TileTextureManager.bind} composes it in full
+     * the first time it needs it, so composing it now would only burn a worker on something
+     * nobody is looking at. A tile that is requested but off screen is remembered in {@link
+     * #staleTiles} and recomposed when {@link #setViewport} brings it back into view. Without
+     * those gates every captured chunk would schedule its covering tile at every LOD even when
+     * no texture can consume the resulting pixels.
+     */
+    private void markDirty(final TileKey key, final long token) {
+        markDirty(key, DirtyWork.full(token));
+    }
+
+    private void markDirtyRegion(
+        final TileKey key, final long token, final int regionX, final int regionZ
+    ) {
+        queueDirty(key, DirtyWork.regions(token, regionX, regionZ));
+    }
+
+    private void markDirtyChunkRegion(
+        final TileKey key,
+        final long token,
+        final int chunkX,
+        final int chunkZ,
+        final int regionX,
+        final int regionZ
+    ) {
+        queueDirty(key, DirtyWork.chunk(token, chunkX, chunkZ, regionX, regionZ));
+    }
+
+    private void markDirty(final TileKey key, final DirtyWork work) {
+        queueDirty(key, work);
+        pump();
+    }
+
+    private void queueDirty(final TileKey key, final DirtyWork work) {
+        synchronized (this) {
+            if (!requestedTiles.contains(key)) {
+                return;
+            }
+            // Both renderers publish their rectangle immediately before drawing tiles and clear
+            // it when they stop, so a null viewport means no map surface is on screen at all.
+            if (viewport == null || !viewport.contains(key)) {
+                staleTiles.add(key);
+                return;
+            }
+            if (inFlight.contains(key)) {
+                // Already composing; the in-flight pass will pick up a fresh copy of the
+                // store, so nothing more to do unless it's already done - re-mark dirty is
+                // cheap and safe either way since composeTile() below removes from inFlight
+                // before this lock is next taken.
+                dirty.merge(key, work, DirtyWork::merge);
+                return;
+            }
+            dirty.merge(key, work, DirtyWork::merge);
+        }
+    }
+
+    private void pump() {
+        while (true) {
+            final TileKey next;
+            final DirtyWork work;
+            final long generation;
+            synchronized (this) {
+                if (inFlight.size() >= maxConcurrentCompositions || dirty.isEmpty()) {
+                    return;
+                }
+                // Every in-flight composition ends in one queued upload. Starting more than the
+                // queue can still take would push finished tiles back out of it; leaving them in
+                // the dirty map instead costs latency, not pixels. drainUploads() pumps again.
+                if (uploads.size() + inFlight.size() >= UPLOAD_QUEUE_CAPACITY) {
+                    return;
+                }
+                next = nearestDirty();
+                if (next == null) {
+                    return;
+                }
+                work = dirty.remove(next);
+                generation = compositionGeneration;
+                inFlight.add(next);
+            }
+            executors.workers().execute(() -> composeAndFinish(next, work, generation));
+        }
+    }
+
+    /** Caller must hold the monitor. */
+    private TileKey nearestDirty() {
+        final int vx = viewpointX;
+        final int vz = viewpointZ;
+        final ViewportRect activeViewport = viewport;
+        TileKey best = null;
+        long bestDist = Long.MAX_VALUE;
+        boolean bestInViewport = false;
+        for (final TileKey key : dirty.keySet()) {
+            if (inFlight.contains(key)) {
+                continue;
+            }
+            final boolean inViewport = activeViewport != null && activeViewport.contains(key);
+            if (inViewport) {
+                if (!bestInViewport || best == null || rowMajorBefore(key, best)) {
+                    best = key;
+                    bestInViewport = true;
+                }
+                continue;
+            }
+            if (bestInViewport) {
+                continue;
+            }
+            // Half the tile's own edge length in blocks, e.g. 128 at LOD0, 2048 at LOD4 -
+            // using a fixed LOD0-sized offset here would skew priority for higher-LOD tiles.
+            final long half = 128L << key.lod();
+            final long dx = key.originBlockX() + half - vx;
+            final long dz = key.originBlockZ() + half - vz;
+            final long dist = dx * dx + dz * dz;
+            if (dist < bestDist) {
+                bestDist = dist;
+                best = key;
+            }
+        }
+        return best;
+    }
+
+    private static boolean rowMajorBefore(final TileKey candidate, final TileKey current) {
+        return candidate.tileZ() < current.tileZ()
+            || (candidate.tileZ() == current.tileZ() && candidate.tileX() < current.tileX());
+    }
+
+    private void composeAndFinish(final TileKey key, final DirtyWork work, final long generation) {
+        try {
+            final TileUpdate update = composeTile(key, work);
+            if (update != null) {
+                pushUpload(update, generation);
+            }
+        } finally {
+            synchronized (this) {
+                inFlight.remove(key);
+            }
+            pump();
+        }
+    }
+
+    private TileUpdate composeTile(final TileKey key, final long token) {
+        return composeTile(key, DirtyWork.full(token));
+    }
+
+    private TileUpdate composeTile(final TileKey key, final DirtyWork work) {
+        final DaylightModel.State lighting = daylightModel.state();
+        return composeTile(
+            key, work,
+            config.dynamicLighting,
+            lighting.daylight(),
+            lighting.gamma()
+        );
+    }
+
+    private TileUpdate composeTile(
+        final TileKey key,
+        final long token,
+        final boolean dynamicLighting,
+        final float requestedDaylightFactor,
+        final float gamma
+    ) {
+        return composeTile(
+            key, DirtyWork.full(token), dynamicLighting, requestedDaylightFactor, gamma
+        );
+    }
+
+    private TileUpdate composeTile(
+        final TileKey key,
+        final DirtyWork work,
+        final boolean dynamicLighting,
+        final float requestedDaylightFactor,
+        final float gamma
+    ) {
+        final MapWorld world = mapWorlds.ifCurrent(work.token);
+        if (world == null) {
+            return null;
+        }
+        final boolean biomeMode = BiomeTileKeys.isBiome(key);
+        final MapLayer layer = MapLayer.parse(BiomeTileKeys.realLayerId(key.layerId()));
+        final MapColorStyle mapColorStyle = config.mapColorStyle;
+        final XaeroMapStyle.Shadow xaeroShadow = XaeroMapStyle.shadowFor(key.dimension());
+        final ColumnStore store = world.store(layer);
+        // The roof view is block-accurate and lives around one almost-flat Y. Keep the shared,
+        // symmetric local relief there, but omit the fixed Y=80 absolute-height wash that used to
+        // turn the whole bedrock roof pale.
+        final boolean applyAbsoluteHeight = layer.type() != MapLayer.Type.NETHER_CEILING;
+        // Dynamic daylight only touches SURFACE. NETHER_CEILING has no sky cycle, but its static
+        // per-column block light is applied separately below from ChunkSnapshot#light.
+        final boolean applyDaylight = !biomeMode
+            && layer.type() == MapLayer.Type.SURFACE
+            && dynamicLighting;
+        final float daylightFactor = applyDaylight ? requestedDaylightFactor : 1f;
+        // SURFACE tiles always carry their re-light inputs, even with dynamic lighting off
+        // (compose then leaves pixels undarkened, which is exactly "composed at factor 1.0"),
+        // so toggling the setting on relights already-uploaded tiles instead of stranding them.
+        final boolean carriesLight = !biomeMode && layer.type() == MapLayer.Type.SURFACE;
+        // Only the sub-rects actually composed from in-memory regions are claimed; the
+        // texture cache preserves its previous pixels everywhere else, so a recompose can
+        // never erase a quadrant whose backing region was evicted to disk in the meantime.
+        final List<TileUpdate.Rect> changed = new ArrayList<>();
+        final int[] pixels;
+        final byte[] lightPlane;
+        TileUpdate.Rect payloadBounds = null;
+        if (key.lod() == 0) {
+            final TileUpdate.Rect dirtyRect = work.lod0Rect == null
+                ? DirtyWork.FULL_RECT
+                : work.lod0Rect;
+            final boolean packedPatch = work.lod0Rect != null;
+            final ComposeScratch scratch = COMPOSE_SCRATCH.get();
+            final int[] composedPixels = packedPatch
+                ? scratch.outputPixels
+                : new int[RegionColumns.SIZE * RegionColumns.SIZE];
+            final byte[] composedLight = carriesLight
+                ? (packedPatch
+                    ? scratch.outputLight
+                    : new byte[RegionColumns.SIZE * RegionColumns.SIZE])
+                : null;
+            composeLod0(
+                store, key.tileX(), key.tileZ(), biomeMode, applyAbsoluteHeight,
+                layer.type(), applyDaylight, daylightFactor, gamma, composedLight,
+                mapColorStyle, xaeroShadow, dirtyRect, composedPixels
+            );
+            if (store.region(key.tileX(), key.tileZ()) != null) {
+                changed.add(dirtyRect);
+            }
+            if (packedPatch && !changed.isEmpty()) {
+                pixels = packRect(composedPixels, dirtyRect);
+                lightPlane = composedLight == null ? null : packRect(composedLight, dirtyRect);
+                payloadBounds = dirtyRect;
+            } else {
+                pixels = composedPixels;
+                lightPlane = composedLight;
+            }
+        } else {
+            lightPlane = carriesLight
+                ? new byte[RegionColumns.SIZE * RegionColumns.SIZE]
+                : null;
+            pixels = composeLodN(
+                store, key, biomeMode, applyAbsoluteHeight,
+                layer.type(), applyDaylight, daylightFactor, gamma, lightPlane, changed,
+                mapColorStyle, xaeroShadow, work.regions
+            );
+        }
+        final TileUpdate.Relight relight = lightPlane == null
+            ? null
+            : new TileUpdate.Relight(daylightFactor, gamma, lightPlane, mapColorStyle);
+        return payloadBounds == null
+            ? new TileUpdate(key, pixels, List.copyOf(changed), relight)
+            : TileUpdate.patch(key, pixels, payloadBounds, relight);
+    }
+
+    /**
+     * One LOD-0 region (256x256 blocks, 1 pixel/block), fully transparent where untouched.
+     * {@code outLight}, when non-null, receives the region's per-pixel block-light plane
+     * (zeros where untouched) for the tile's {@link TileUpdate.Relight}.
+     */
+    private static void composeLod0(
+        final ColumnStore store,
+        final int regionX,
+        final int regionZ,
+        final boolean biomeMode,
+        final boolean applyAbsoluteHeight,
+        final MapLayer.Type layerType,
+        final boolean applyDaylight,
+        final float daylightFactor,
+        final float gamma,
+        final byte[] outLight,
+        final MapColorStyle mapColorStyle,
+        final XaeroMapStyle.Shadow xaeroShadow,
+        final TileUpdate.Rect dirtyRect,
+        final int[] pixels
+    ) {
+        final RegionColumns region = store.region(regionX, regionZ);
+        if (region != null) {
+            final RegionNeighborhood neighborhood = new RegionNeighborhood(
+                region,
+                store.region(regionX, regionZ - 1),
+                store.region(regionX + 1, regionZ - 1),
+                store.region(regionX + 1, regionZ),
+                store.region(regionX + 1, regionZ + 1),
+                store.region(regionX, regionZ + 1),
+                store.region(regionX - 1, regionZ + 1),
+                store.region(regionX - 1, regionZ),
+                store.region(regionX - 1, regionZ - 1)
+            );
+            composeRegion(
+                neighborhood, pixels,
+                biomeMode, applyAbsoluteHeight, layerType,
+                applyDaylight, daylightFactor, gamma, outLight, mapColorStyle, xaeroShadow,
+                dirtyRect
+            );
+        }
+    }
+
+    /**
+     * A LOD-{@code key.lod()} tile covers {@code 2^lod x 2^lod} LOD-0 regions. Each
+     * affected covered region is composed exactly as at LOD0 (reusing {@link #composeLod0}, so
+     * cross-region slope shading at every LOD-0 boundary - including ones that fall
+     * inside this LOD's tile, not just at its own edges - stays correct), then
+     * box-averaged down by {@code 2^lod} (via repeated 2x2 alpha-weighted {@link Argb#average4Weighted}
+     * passes, i.e. a small mipmap chain, so a region that is only partly explored downsamples to a
+     * clean translucent value instead of darkening toward black) and stitched into its quadrant
+     * of the 256x256 output. A full request visits every covered region; an incremental request
+     * visits only its merged dirty-region set. Regions not in memory are skipped AND left out of
+     * {@code outChanged}, so the texture cache preserves those quadrants.
+     */
+    private static int[] composeLodN(
+        final ColumnStore store,
+        final TileKey key,
+        final boolean biomeMode,
+        final boolean applyAbsoluteHeight,
+        final MapLayer.Type layerType,
+        final boolean applyDaylight,
+        final float daylightFactor,
+        final float gamma,
+        final byte[] outLight,
+        final List<TileUpdate.Rect> outChanged,
+        final MapColorStyle mapColorStyle,
+        final XaeroMapStyle.Shadow xaeroShadow,
+        final Set<Long> dirtyRegions
+    ) {
+        final int lod = key.lod();
+        final int size = RegionColumns.SIZE;
+        final int regionsPerSide = 1 << lod;
+        final int subSize = size >> lod;
+        final int baseRegionX = key.tileX() << lod;
+        final int baseRegionZ = key.tileZ() << lod;
+        final int[] outPixels = new int[size * size];
+        for (int dz = 0; dz < regionsPerSide; dz++) {
+            for (int dx = 0; dx < regionsPerSide; dx++) {
+                final int regionX = baseRegionX + dx;
+                final int regionZ = baseRegionZ + dz;
+                if (dirtyRegions != null && !dirtyRegions.contains(regionKey(regionX, regionZ))) {
+                    continue;
+                }
+                if (store.region(regionX, regionZ) == null) {
+                    continue;
+                }
+                final ComposeScratch scratch = COMPOSE_SCRATCH.get();
+                final byte[] fullLight = outLight == null ? null : scratch.outputLight;
+                final int[] full = scratch.outputPixels;
+                composeLod0(
+                    store, regionX, regionZ, biomeMode, applyAbsoluteHeight,
+                    layerType, applyDaylight, daylightFactor, gamma, fullLight,
+                    mapColorStyle, xaeroShadow, DirtyWork.FULL_RECT, full
+                );
+                final int[] downsampled = downsample(full, size, lod);
+                stitch(downsampled, subSize, outPixels, dx * subSize, dz * subSize);
+                if (outLight != null) {
+                    stitchLight(downsampleLight(fullLight, size, lod), subSize, outLight, dx * subSize, dz * subSize);
+                }
+                outChanged.add(new TileUpdate.Rect(dx * subSize, dz * subSize, subSize, subSize));
+            }
+        }
+        return outPixels;
+    }
+
+    /** Repeated 2x2 box-average halving, {@code steps} times: {@code size -> size >> steps}. */
+    private static int[] downsample(final int[] src, final int size, final int steps) {
+        int[] current = src;
+        int currentSize = size;
+        for (int step = 0; step < steps; step++) {
+            final int nextSize = currentSize / 2;
+            final int[] next = new int[nextSize * nextSize];
+            for (int z = 0; z < nextSize; z++) {
+                final int z0 = z * 2;
+                final int z1 = z0 + 1;
+                for (int x = 0; x < nextSize; x++) {
+                    final int x0 = x * 2;
+                    final int x1 = x0 + 1;
+                    next[z * nextSize + x] = Argb.average4Weighted(
+                        current[z0 * currentSize + x0], current[z0 * currentSize + x1],
+                        current[z1 * currentSize + x0], current[z1 * currentSize + x1]
+                    );
+                }
+            }
+            current = next;
+            currentSize = nextSize;
+        }
+        return current;
+    }
+
+    /** Copies a {@code blockSize x blockSize} block into the 256x256 {@code out} at pixel offset (offsetX, offsetZ). */
+    private static void stitch(final int[] block, final int blockSize, final int[] out, final int offsetX, final int offsetZ) {
+        final int outSize = RegionColumns.SIZE;
+        for (int z = 0; z < blockSize; z++) {
+            System.arraycopy(block, z * blockSize, out, (offsetZ + z) * outSize + offsetX, blockSize);
+        }
+    }
+
+    /**
+     * Block-light counterpart of {@link #downsample}: repeated rounded 2x2 averaging of the
+     * 0-15 levels. A plain average (no alpha weighting) is enough here - the levels only
+     * steer how strongly a re-light darkens each pixel, and at coarse LODs a torch is a
+     * sub-pixel detail either way.
+     */
+    private static byte[] downsampleLight(final byte[] src, final int size, final int steps) {
+        byte[] current = src;
+        int currentSize = size;
+        for (int step = 0; step < steps; step++) {
+            final int nextSize = currentSize / 2;
+            final byte[] next = new byte[nextSize * nextSize];
+            for (int z = 0; z < nextSize; z++) {
+                final int z0 = z * 2;
+                final int z1 = z0 + 1;
+                for (int x = 0; x < nextSize; x++) {
+                    final int x0 = x * 2;
+                    final int x1 = x0 + 1;
+                    final int sum = current[z0 * currentSize + x0] + current[z0 * currentSize + x1]
+                        + current[z1 * currentSize + x0] + current[z1 * currentSize + x1];
+                    next[z * nextSize + x] = (byte) ((sum + 2) >> 2);
+                }
+            }
+            current = next;
+            currentSize = nextSize;
+        }
+        return current;
+    }
+
+    private static void stitchLight(final byte[] block, final int blockSize, final byte[] out, final int offsetX, final int offsetZ) {
+        final int outSize = RegionColumns.SIZE;
+        for (int z = 0; z < blockSize; z++) {
+            System.arraycopy(block, z * blockSize, out, (offsetZ + z) * outSize + offsetX, blockSize);
+        }
+    }
+
+    private static int[] packRect(final int[] source, final TileUpdate.Rect rect) {
+        final int[] packed = new int[rect.width() * rect.height()];
+        for (int row = 0; row < rect.height(); row++) {
+            System.arraycopy(
+                source,
+                (rect.y() + row) * RegionColumns.SIZE + rect.x(),
+                packed,
+                row * rect.width(),
+                rect.width()
+            );
+        }
+        return packed;
+    }
+
+    private static byte[] packRect(final byte[] source, final TileUpdate.Rect rect) {
+        final byte[] packed = new byte[rect.width() * rect.height()];
+        for (int row = 0; row < rect.height(); row++) {
+            System.arraycopy(
+                source,
+                (rect.y() + row) * RegionColumns.SIZE + rect.x(),
+                packed,
+                row * rect.width(),
+                rect.width()
+            );
+        }
+        return packed;
+    }
+
+    private static void composeRegion(
+        final RegionNeighborhood neighborhood,
+        final int[] outPixels,
+        final boolean biomeMode,
+        final boolean applyAbsoluteHeight,
+        final MapLayer.Type layerType,
+        final boolean applyDaylight,
+        final float daylightFactor,
+        final float gamma,
+        final byte[] outLight,
+        final MapColorStyle mapColorStyle,
+        final XaeroMapStyle.Shadow xaeroShadow,
+        final TileUpdate.Rect dirtyRect
+    ) {
+        final int size = RegionColumns.SIZE;
+        final ComposeScratch scratch = COMPOSE_SCRATCH.get();
+        final short[] surfaceY = scratch.surfaceY;
+        final String[] biomeId = scratch.biomeId;
+        final byte[] fluidDepth = scratch.fluidDepth;
+        final int[] baseArgb = scratch.baseArgb;
+        final int[] xaeroBaseArgb = scratch.xaeroBaseArgb;
+        final int[] tintArgb = scratch.tintArgb;
+        final int[] overlayArgb = scratch.overlayArgb;
+        final int[] xaeroOverlayArgb = scratch.xaeroOverlayArgb;
+        final byte[] kind = scratch.kind;
+        final byte[] light = scratch.light;
+        final int firstSourceRow = Math.max(0, dirtyRect.y() - 1);
+        final int lastSourceRow = Math.min(size, dirtyRect.y() + dirtyRect.height() + 1);
+        neighborhood.center().copyRowsAtSameOffset(
+            firstSourceRow, lastSourceRow - firstSourceRow,
+            surfaceY, biomeId, fluidDepth,
+            baseArgb, xaeroBaseArgb, tintArgb, overlayArgb, xaeroOverlayArgb, kind, light
+        );
+        if (outLight != null) {
+            for (int z = dirtyRect.y(); z < dirtyRect.y() + dirtyRect.height(); z++) {
+                final int offset = z * size + dirtyRect.x();
+                System.arraycopy(light, offset, outLight, offset, dirtyRect.width());
+            }
+        }
+
+        for (int z = dirtyRect.y(); z < dirtyRect.y() + dirtyRect.height(); z++) {
+            for (int x = dirtyRect.x(); x < dirtyRect.x() + dirtyRect.width(); x++) {
+                final int idx = z * size + x;
+                final byte k = kind[idx];
+                if (k == SurfaceKind.UNKNOWN.ordinal() || k == SurfaceKind.VOID.ordinal()) {
+                    outPixels[idx] = Argb.TRANSPARENT;
+                    continue;
+                }
+                if (biomeMode) {
+                    outPixels[idx] = BiomeColorPalette.color(biomeId[idx]);
+                    continue;
+                }
+                if (mapColorStyle == MapColorStyle.XAERO) {
+                    outPixels[idx] = composeXaeroColumn(
+                        x, z, surfaceY, fluidDepth, kind, xaeroBaseArgb, tintArgb, xaeroOverlayArgb,
+                        neighborhood, xaeroShadow, layerType,
+                        applyDaylight, daylightFactor, gamma, light[idx]
+                    );
+                    continue;
+                }
+                final double surfaceHeightShade = applyAbsoluteHeight
+                    ? ShadingPipeline.detailedHeightShade(surfaceY[idx], ShadingPipeline.REFERENCE_HEIGHT)
+                    : 0.0;
+                final double surfaceRelief = reliefMultiplier(
+                    x, z, false, surfaceY, fluidDepth, kind, neighborhood
+                );
+                final int shadedBase = ShadingPipeline.applyBrightnessMultiplier(
+                    ShadingPipeline.applyShade(Argb.multiply(baseArgb[idx], tintArgb[idx]), surfaceHeightShade),
+                    surfaceRelief
+                );
+                final boolean waterOrIce = k == SurfaceKind.WATER.ordinal() || k == SurfaceKind.ICE.ordinal();
+                final int floorY = surfaceY[idx] - (fluidDepth[idx] & 0xFF);
+                final double overlayHeightShade = waterOrIce && applyAbsoluteHeight
+                    ? ShadingPipeline.detailedHeightShade(floorY, ShadingPipeline.REFERENCE_HEIGHT)
+                    : surfaceHeightShade;
+                final double overlayRelief = waterOrIce
+                    ? reliefMultiplier(x, z, true, surfaceY, fluidDepth, kind, neighborhood)
+                    : surfaceRelief;
+                int shadedOverlay = overlayArgb[idx] == Argb.TRANSPARENT
+                    ? Argb.TRANSPARENT
+                    : ShadingPipeline.applyBrightnessMultiplier(
+                        ShadingPipeline.applyShade(overlayArgb[idx], overlayHeightShade), overlayRelief
+                    );
+                if (waterOrIce && shadedOverlay != Argb.TRANSPARENT) {
+                    shadedOverlay = ShadingPipeline.applyBrightnessMultiplier(
+                        shadedOverlay, ShadingPipeline.seafloorBrightness(fluidDepth[idx] & 0xFF)
+                    );
+                }
+                int composed = waterOrIce
+                    ? ShadingPipeline.compositeOver(shadedBase, shadedOverlay)
+                    : ShadingPipeline.compositeOver(shadedOverlay, shadedBase);
+                if (applyDaylight) {
+                    composed = ShadingPipeline.applyDaylight(
+                        composed, daylightFactor, light[idx], gamma
+                    );
+                } else if (layerType == MapLayer.Type.NETHER_CEILING) {
+                    composed = LightTint.applyBlockLightOverAmbient(
+                        composed, light[idx] & 0xFF, true, gamma
+                    );
+                } else if (layerType == MapLayer.Type.END_SURFACE) {
+                    // END_SURFACE snapshots keep raw colours (no daylight model covers the End),
+                    // so the zero-sky-light curve - readability floor, warm tint, gamma - is
+                    // multiplied in here. Applying it at composition, not capture, also relights
+                    // every already-cached region the moment the fix ships.
+                    composed = LightTint.applyBlockLightTint(
+                        composed, light[idx] & 0xFF, false, gamma
+                    );
+                } else if (usesBakedLight(layerType)) {
+                    composed = LightTint.applyGammaOverBakedLight(
+                        composed,
+                        light[idx] & 0xFF,
+                        layerType.isNetherFloor(),
+                        gamma
+                    );
+                }
+                outPixels[idx] = composed;
+            }
+        }
+    }
+
+    private static int composeXaeroColumn(
+        final int x,
+        final int z,
+        final short[] surfaceY,
+        final byte[] fluidDepth,
+        final byte[] kind,
+        final int[] baseArgb,
+        final int[] tintArgb,
+        final int[] overlayArgb,
+        final RegionNeighborhood neighborhood,
+        final XaeroMapStyle.Shadow shadow,
+        final MapLayer.Type layerType,
+        final boolean applyDaylight,
+        final float daylightFactor,
+        final float gamma,
+        final byte blockLight
+    ) {
+        final int idx = z * RegionColumns.SIZE + x;
+        final boolean waterOrIce = kind[idx] == SurfaceKind.WATER.ordinal()
+            || kind[idx] == SurfaceKind.ICE.ordinal();
+        final int surface = surfaceY[idx];
+        final int floor = surface - (fluidDepth[idx] & 0xFF);
+        final int tintedBase = Argb.multiply(baseArgb[idx], tintArgb[idx]);
+        final int composed;
+        if (waterOrIce) {
+            int shadedFloor = overlayArgb[idx] == Argb.TRANSPARENT
+                ? Argb.TRANSPARENT
+                : XaeroMapStyle.applyTerrain(
+                    overlayArgb[idx], floor,
+                    reliefHeight(x, z - 1, true, surfaceY, fluidDepth, kind, neighborhood),
+                    reliefHeight(x - 1, z - 1, true, surfaceY, fluidDepth, kind, neighborhood),
+                    1, true, shadow
+                );
+            shadedFloor = ShadingPipeline.applyBrightnessMultiplier(
+                shadedFloor, XaeroMapStyle.transparentFloorBrightness(fluidDepth[idx] & 0xFF)
+            );
+            composed = ShadingPipeline.compositeOver(tintedBase, shadedFloor);
+        } else {
+            final int shadedBase = XaeroMapStyle.applyTerrain(
+                tintedBase, surface,
+                reliefHeight(x, z - 1, false, surfaceY, fluidDepth, kind, neighborhood),
+                reliefHeight(x - 1, z - 1, false, surfaceY, fluidDepth, kind, neighborhood),
+                1, true, shadow
+            );
+            composed = ShadingPipeline.compositeOver(overlayArgb[idx], shadedBase);
+        }
+        if (applyDaylight) {
+            return Argb.scale(
+                composed,
+                ShadingPipeline.applyGamma(
+                    XaeroMapStyle.daylightScale(daylightFactor, blockLight & 0xFF), gamma
+                )
+            );
+        }
+        if (layerType == MapLayer.Type.END_SURFACE) {
+            // Same raw-colour contract as the Conflux branch above: the curve is applied here,
+            // never baked into the snapshot, so the Xaero style darkens the End identically.
+            return LightTint.applyBlockLightTint(composed, blockLight & 0xFF, false, gamma);
+        }
+        return usesBakedLight(layerType)
+            ? LightTint.applyGammaOverBakedLight(
+                composed,
+                blockLight & 0xFF,
+                layerType.isNetherFloor(),
+                gamma
+            )
+            : composed;
+    }
+
+    private static boolean usesBakedLight(final MapLayer.Type layerType) {
+        return layerType == MapLayer.Type.CAVE_AUTO
+            || layerType == MapLayer.Type.CAVE_SLICE
+            || layerType == MapLayer.Type.NETHER_CURRENT
+            || layerType == MapLayer.Type.NETHER_SLICE;
+    }
+
+    private static double reliefMultiplier(
+        final int x,
+        final int z,
+        final boolean bathymetry,
+        final short[] localSurfaceY,
+        final byte[] localFluidDepth,
+        final byte[] localKind,
+        final RegionNeighborhood neighborhood
+    ) {
+        return ShadingPipeline.directionalReliefMultiplier(
+            reliefHeight(x - 1, z, bathymetry, localSurfaceY, localFluidDepth, localKind, neighborhood),
+            reliefHeight(x, z + 1, bathymetry, localSurfaceY, localFluidDepth, localKind, neighborhood),
+            reliefHeight(x - 1, z + 1, bathymetry, localSurfaceY, localFluidDepth, localKind, neighborhood),
+            reliefHeight(x + 1, z, bathymetry, localSurfaceY, localFluidDepth, localKind, neighborhood),
+            reliefHeight(x, z - 1, bathymetry, localSurfaceY, localFluidDepth, localKind, neighborhood),
+            reliefHeight(x + 1, z - 1, bathymetry, localSurfaceY, localFluidDepth, localKind, neighborhood),
+            1
+        );
+    }
+
+    private static Integer reliefHeight(
+        final int x,
+        final int z,
+        final boolean bathymetry,
+        final short[] localSurfaceY,
+        final byte[] localFluidDepth,
+        final byte[] localKind,
+        final RegionNeighborhood neighborhood
+    ) {
+        if (x >= 0 && x < RegionColumns.SIZE && z >= 0 && z < RegionColumns.SIZE) {
+            final int index = z * RegionColumns.SIZE + x;
+            final short value = localSurfaceY[index];
+            // Void/unknown columns never provide relief height, matching RegionColumns.reliefYAt
+            // and surfaceYAt: legacy cached void columns still carry a fabricated pivot-relative
+            // Y, which must shade as an absent neighbor rather than a fake cliff.
+            final byte k = localKind[index];
+            if (value == ChunkSnapshot.NO_SURFACE
+                || k == SurfaceKind.UNKNOWN.ordinal()
+                || k == SurfaceKind.VOID.ordinal()) {
+                return null;
+            }
+            if (!bathymetry
+                || (k != SurfaceKind.WATER.ordinal()
+                    && k != SurfaceKind.ICE.ordinal())) {
+                return (int) value;
+            }
+            return (int) value - (localFluidDepth[index] & 0xFF);
+        }
+        final int regionDx = x < 0 ? -1 : x >= RegionColumns.SIZE ? 1 : 0;
+        final int regionDz = z < 0 ? -1 : z >= RegionColumns.SIZE ? 1 : 0;
+        final RegionColumns region = neighborhood.at(regionDx, regionDz);
+        if (region == null) {
+            return null;
+        }
+        final int localX = Math.floorMod(x, RegionColumns.SIZE);
+        final int localZ = Math.floorMod(z, RegionColumns.SIZE);
+        final short value = region.reliefYAt(localX, localZ, bathymetry);
+        return value == ChunkSnapshot.NO_SURFACE ? null : (int) value;
+    }
+
+    private record RegionNeighborhood(
+        RegionColumns center,
+        RegionColumns north,
+        RegionColumns northEast,
+        RegionColumns east,
+        RegionColumns southEast,
+        RegionColumns south,
+        RegionColumns southWest,
+        RegionColumns west,
+        RegionColumns northWest
+    ) {
+        RegionColumns at(final int dx, final int dz) {
+            if (dx == 0 && dz == 0) {
+                return center;
+            }
+            if (dx == 0 && dz < 0) {
+                return north;
+            }
+            if (dx > 0 && dz < 0) {
+                return northEast;
+            }
+            if (dx > 0 && dz == 0) {
+                return east;
+            }
+            if (dx > 0) {
+                return southEast;
+            }
+            if (dx == 0) {
+                return south;
+            }
+            if (dz > 0) {
+                return southWest;
+            }
+            if (dz == 0) {
+                return west;
+            }
+            return northWest;
+        }
+    }
+
+    /**
+     * Queues a finished composition for the render thread, evicting the oldest pending upload
+     * while the queue is over capacity.
+     *
+     * <p>An evicted update is handed back to whoever can compose it again instead of being
+     * forgotten. Composition already took its tile out of {@link #dirty} and its pixels live
+     * nowhere else, while {@code TileTextureManager} only re-requests a tile whose texture is
+     * missing entirely - so a tile that is already on screen would otherwise keep showing the
+     * composition it happened to be uploaded with, missing every chunk captured since, until
+     * something unrelated evicted its texture.
+     */
+    private void pushUpload(final TileUpdate update) {
+        pushUpload(update, null);
+    }
+
+    private void pushUpload(final TileUpdate update, final Long expectedGeneration) {
+        final List<TileKey> evicted;
+        synchronized (this) {
+            if (expectedGeneration != null
+                && expectedGeneration.longValue() != compositionGeneration) {
+                return;
+            }
+            final TileUpdate pending = uploads.remove(update.key());
+            uploads.put(
+                update.key(),
+                pending == null ? update : TileUpdate.merge(pending, update)
+            );
+            if (uploads.size() <= UPLOAD_QUEUE_CAPACITY) {
+                return;
+            }
+            evicted = new ArrayList<>();
+            while (uploads.size() > UPLOAD_QUEUE_CAPACITY) {
+                final TileKey oldest = uploads.keySet().iterator().next();
+                uploads.remove(oldest);
+                evicted.add(oldest);
+            }
+        }
+        // Outside the monitor: recomposing goes back through markDirty() and pump().
+        for (final TileKey key : evicted) {
+            recomposeEvicted(key);
+        }
+    }
+
+    private void recomposeEvicted(final TileKey key) {
+        if (PredictedTileKeys.isPredicted(key)) {
+            predictedUploadReloader.accept(key);
+            return;
+        }
+        final MapWorld world = mapWorlds.current();
+        if (world == null
+            || !key.world().equals(world.session().world())
+            || !key.dimension().equals(world.session().dimension())) {
+            // A session change already invalidated the tile; onSessionChanged cleared the queue.
+            return;
+        }
+        markDirty(key, world.session().token());
+    }
+
+    private record ViewportRect(
+        MapLayer.Type layerType, int lod, int minTileX, int maxTileX, int minTileZ, int maxTileZ
+    ) {
+        boolean contains(final TileKey key) {
+            return key.lod() == lod
+                && key.tileX() >= minTileX && key.tileX() <= maxTileX
+                && key.tileZ() >= minTileZ && key.tileZ() <= maxTileZ;
+        }
+    }
+
+    /**
+     * Public entry point for a composer that isn't this class's own {@link #pump}/{@link
+     * #composeAndFinish} pipeline (see {@code core.predict.PredictionTileService}) to share this
+     * same bounded, key-deduped upload queue instead of maintaining a second one.
+     */
+    public void submitUpload(final TileUpdate update) {
+        pushUpload(update);
+    }
+
+    /** Drops queued uploads matching a cache-plane predicate before that plane is rebuilt. */
+    public synchronized void discardUploads(final Predicate<TileKey> predicate) {
+        uploads.keySet().removeIf(predicate);
+    }
+
+    /** Render thread: pop up to {@code max} freshly-composed tiles to upload to the GPU. */
+    public List<TileUpdate> drainUploads(final int max) {
+        final List<TileUpdate> result = new ArrayList<>(Math.min(max, UPLOAD_QUEUE_CAPACITY));
+        synchronized (this) {
+            final var it = uploads.entrySet().iterator();
+            while (it.hasNext() && result.size() < max) {
+                result.add(it.next().getValue());
+                it.remove();
+            }
+        }
+        if (!result.isEmpty()) {
+            // The room this just freed is what the composition backpressure in pump() waits for.
+            pump();
+        }
+        return result;
+    }
+
+    /** Test-support only: number of local-map compositions currently assigned to workers. */
+    public synchronized int inFlightCountForTest() {
+        return inFlight.size();
+    }
+
+    /** Test-support only: whether every local-map composition has drained. */
+    public synchronized boolean isIdleForTest() {
+        return dirty.isEmpty() && inFlight.isEmpty();
+    }
+
+    private static long regionKey(final int regionX, final int regionZ) {
+        return ((long) regionX << 32) | (regionZ & 0xFFFFFFFFL);
+    }
+
+    /** Worker-local planes reused across compositions; no instance escapes into an upload. */
+    private static final class ComposeScratch {
+        private static final int PIXELS = RegionColumns.SIZE * RegionColumns.SIZE;
+
+        final short[] surfaceY = new short[PIXELS];
+        final String[] biomeId = new String[PIXELS];
+        final byte[] fluidDepth = new byte[PIXELS];
+        final int[] baseArgb = new int[PIXELS];
+        final int[] xaeroBaseArgb = new int[PIXELS];
+        final int[] tintArgb = new int[PIXELS];
+        final int[] overlayArgb = new int[PIXELS];
+        final int[] xaeroOverlayArgb = new int[PIXELS];
+        final byte[] kind = new byte[PIXELS];
+        final byte[] light = new byte[PIXELS];
+        final int[] outputPixels = new int[PIXELS];
+        final byte[] outputLight = new byte[PIXELS];
+    }
+
+    private record DirtyWork(long token, Set<Long> regions, TileUpdate.Rect lod0Rect) {
+        private static final TileUpdate.Rect FULL_RECT = new TileUpdate.Rect(
+            0, 0, RegionColumns.SIZE, RegionColumns.SIZE
+        );
+
+        static DirtyWork full(final long token) {
+            return new DirtyWork(token, null, null);
+        }
+
+        static DirtyWork regions(final long token, final int regionX, final int regionZ) {
+            return new DirtyWork(token, Set.of(regionKey(regionX, regionZ)), FULL_RECT);
+        }
+
+        static DirtyWork chunk(
+            final long token,
+            final int chunkX,
+            final int chunkZ,
+            final int regionX,
+            final int regionZ
+        ) {
+            final long regionOriginX = (long) regionX * RegionColumns.SIZE;
+            final long regionOriginZ = (long) regionZ * RegionColumns.SIZE;
+            final long chunkOriginX = (long) chunkX * 16L;
+            final long chunkOriginZ = (long) chunkZ * 16L;
+            final int minX = (int) Math.max(0L, chunkOriginX - 1L - regionOriginX);
+            final int minZ = (int) Math.max(0L, chunkOriginZ - 1L - regionOriginZ);
+            final int maxX = (int) Math.min(
+                RegionColumns.SIZE, chunkOriginX + 17L - regionOriginX
+            );
+            final int maxZ = (int) Math.min(
+                RegionColumns.SIZE, chunkOriginZ + 17L - regionOriginZ
+            );
+            return new DirtyWork(
+                token,
+                Set.of(regionKey(regionX, regionZ)),
+                new TileUpdate.Rect(minX, minZ, maxX - minX, maxZ - minZ)
+            );
+        }
+
+        static DirtyWork merge(final DirtyWork older, final DirtyWork newer) {
+            if (newer.regions == null || older.regions == null) {
+                return full(newer.token);
+            }
+            final Set<Long> merged = new HashSet<>(older.regions);
+            merged.addAll(newer.regions);
+            return new DirtyWork(
+                newer.token, Set.copyOf(merged), mergeRects(older.lod0Rect, newer.lod0Rect)
+            );
+        }
+
+        private static TileUpdate.Rect mergeRects(
+            final TileUpdate.Rect first, final TileUpdate.Rect second
+        ) {
+            final int minX = Math.min(first.x(), second.x());
+            final int minY = Math.min(first.y(), second.y());
+            final int maxX = Math.max(
+                first.x() + first.width(), second.x() + second.width()
+            );
+            final int maxY = Math.max(
+                first.y() + first.height(), second.y() + second.height()
+            );
+            return new TileUpdate.Rect(minX, minY, maxX - minX, maxY - minY);
+        }
+    }
+}

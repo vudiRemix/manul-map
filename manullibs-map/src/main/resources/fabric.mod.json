@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "manullibs_map",
+  "version": "${version}",
+  "name": "ManulLibs Map",
+  "description": "Карта сервера ManulCraft на основе Conflux Map: включается только на сервере ManulCraft, метки, наведение дронов, границы городов.",
+  "authors": ["ManulCraft"],
+  "contributors": ["Conflux Map authors (https://github.com/Conflux-Union/conflux-map)"],
+  "license": "GPL-3.0-or-later",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["ru.manulcraft.manullibs.ManulLibsClient"],
+    "confluxmap": ["ru.manulcraft.manullibs.map.ManulMapPlugin"]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.9",
+    "minecraft": "~1.21.4",
+    "java": ">=21",
+    "fabric-api": "*",
+    "fabric-language-kotlin": "*",
+    "confluxmap": "*"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "category.manullibs": "ManulLibs (map)",
+  "key.manullibs.toggle_towns": "Toggle town borders",
+  "manullibs.towns.shown": "Town borders: shown",
+  "manullibs.towns.hidden": "Town borders: hidden",
+  "manullibs.map.area.nation": "Nation: ",
+  "manullibs.map.area.no_nation": "No nation",
+  "manullibs.map.action.drone": "Send drone here",
+  "manullibs.map.action.drone.tooltip": "Set this point as the GPS drone target (/manuldrones setgps)",
+  "manullibs.map.action.town_mark": "Town marker",
+  "manullibs.map.action.town_mark.tooltip": "Visible to every resident of your town",
+  "manullibs.map.action.public_mark": "Marker on website",
+  "manullibs.map.action.public_mark.tooltip": "Shows up on the website map (mayor and assistants)",
+  "manullibs.map.action.site": "Open on website",
+  "manullibs.map.action.site.tooltip": "Open this place on map.manulcraft.com",
+  "manullibs.map.mark_name.town": "Town marker name",
+  "manullibs.map.mark_name.public": "Website marker name",
+  "manullibs.map.mark_name.field": "Name"
+}

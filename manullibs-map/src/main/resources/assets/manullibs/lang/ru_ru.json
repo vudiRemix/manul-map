@@ -1,0 +1,19 @@
+{
+  "category.manullibs": "ManulLibs (карта)",
+  "key.manullibs.toggle_towns": "Границы городов вкл/выкл",
+  "manullibs.towns.shown": "Границы городов: показаны",
+  "manullibs.towns.hidden": "Границы городов: скрыты",
+  "manullibs.map.area.nation": "Нация: ",
+  "manullibs.map.area.no_nation": "Без нации",
+  "manullibs.map.action.drone": "Навести дрон сюда",
+  "manullibs.map.action.drone.tooltip": "Задать эту точку как цель GPS-дрона (/manuldrones setgps)",
+  "manullibs.map.action.town_mark": "Метка для города",
+  "manullibs.map.action.town_mark.tooltip": "Метку увидят все жители вашего города",
+  "manullibs.map.action.public_mark": "Метка на сайт",
+  "manullibs.map.action.public_mark.tooltip": "Метка появится на карте сайта (мэр и помощники)",
+  "manullibs.map.action.site": "Открыть на сайте",
+  "manullibs.map.action.site.tooltip": "Открыть это место на map.manulcraft.com",
+  "manullibs.map.mark_name.town": "Название метки для города",
+  "manullibs.map.mark_name.public": "Название метки на сайте",
+  "manullibs.map.mark_name.field": "Название"
+}

@@ -1,0 +1,93 @@
+plugins {
+    id 'java-library'
+}
+
+repositories {
+    mavenCentral()
+}
+
+configurations {
+    webMapAssets
+}
+
+dependencies {
+    // The core api implementation lives here, so api types are part of common's contract.
+    api project(':api')
+    compileOnly 'com.google.code.gson:gson:2.13.2'
+    compileOnlyApi 'org.apache.logging.log4j:log4j-api:2.25.3'
+    implementation 'org.nanohttpd:nanohttpd-websocket:2.3.1'
+    testImplementation 'com.google.code.gson:gson:2.13.2'
+    testImplementation 'org.apache.logging.log4j:log4j-api:2.25.3'
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+    testRuntimeOnly 'org.apache.logging.log4j:log4j-core:2.25.3'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    webMapAssets 'org.webjars.npm:leaflet:1.9.4'
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_16
+    targetCompatibility = JavaVersion.VERSION_16
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 16
+}
+
+test {
+    useJUnitPlatform {
+        excludeTags 'benchmark'
+    }
+}
+
+tasks.register('benchmark', Test) {
+    group = 'verification'
+    description = 'Runs opt-in measurement harnesses.'
+    dependsOn testClasses
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    useJUnitPlatform {
+        includeTags 'benchmark'
+    }
+}
+
+processTestResources {
+    from(rootProject.file('native/prebuilt')) {
+        into 'natives'
+    }
+}
+
+processResources {
+    from({ configurations.webMapAssets.collect { zipTree(it) } }) {
+        include 'META-INF/resources/webjars/leaflet/1.9.4/dist/leaflet.css'
+        include 'META-INF/resources/webjars/leaflet/1.9.4/dist/leaflet.js'
+        include 'META-INF/resources/webjars/leaflet/1.9.4/LICENSE'
+        eachFile { details ->
+            details.path = 'webmap/vendor/' + (details.name == 'LICENSE'
+                ? 'leaflet-LICENSE.txt' : details.name)
+        }
+        includeEmptyDirs = false
+    }
+}
+
+tasks.register('checkPlatformIsolation') {
+    group = 'verification'
+    description = 'Rejects platform APIs and version preprocessing from the shared Java module.'
+    doLast {
+        final List<String> violations = []
+        final def forbidden = ~/^import\s+(static\s+)?(com\.mojang|io\.papermc|net\.fabricmc|net\.minecraft|org\.bukkit|org\.lwjgl|org\.spongepowered)/
+        final def preprocessorDirective = ~/^\/\/(#(?:if|elseif|else|endif)|\$\$)/
+        fileTree('src/main/java').matching { include '**/*.java' }.each { final File file ->
+            file.readLines().eachWithIndex { final String line, final int index ->
+                final String trimmed = line.trim()
+                if (trimmed =~ forbidden || trimmed =~ preprocessorDirective) {
+                    violations << "${file}:${index + 1}: ${line.trim()}"
+                }
+            }
+        }
+        if (!violations.empty) {
+            throw new GradleException("Platform isolation violated:\n" + violations.join('\n'))
+        }
+    }
+}
+
+check.dependsOn 'checkPlatformIsolation'

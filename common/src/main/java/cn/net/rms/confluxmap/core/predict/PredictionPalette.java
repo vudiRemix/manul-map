@@ -1,0 +1,147 @@
+package cn.net.rms.confluxmap.core.predict;
+
+import cn.net.rms.confluxmap.core.color.MaterialDetailProfile;
+import cn.net.rms.confluxmap.core.model.SurfaceKind;
+import cn.net.rms.confluxmap.core.util.Argb;
+import java.util.EnumMap;
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * Per-session color data for {@link PredictedTileComposer}: a small fixed set of per-{@link
+ * cn.net.rms.confluxmap.core.model.SurfaceKind} base colors plus per-biome ground bases from
+ * {@link BiomeTable} (never overridden, because there is no live-game equivalent of "the sand
+ * color") and a per-biome-id tint table ({@code grassTint}/{@code foliageTint}/{@code
+ * waterTint}) that starts at {@link BiomeTable}'s fallback and gets overwritten, once per
+ * session, by {@code mc.predict.PredictionPaletteBuilder} sampling the client's live biome
+ * registry. Palette data never affects which pixels are water/land/foliage (that's {@link
+ * BaselineDeriver}/{@link CanopyStylizer}, from the baseline sample alone) - only their color.
+ *
+ * <p>Immutable once built: a session either uses {@link #defaults()} (before the builder runs,
+ * or forever for a biome id the registry doesn't know) or a single {@link #fromSamples} snapshot
+ * built fully on the main thread before being published for worker threads to read.
+ */
+public final class PredictionPalette {
+    public final int landBase = BiomeTable.LAND_BASE;
+    public final int sandBase = BiomeTable.SAND_BASE;
+    public final int snowBase = BiomeTable.SNOW_BASE;
+    public final int iceBase = BiomeTable.ICE_BASE;
+    public final int waterBase = BiomeTable.WATER_BASE;
+    public final int foliageBase = BiomeTable.FOLIAGE_BASE;
+
+    /** biomeId -> {grassTint, foliageTint, waterTint}, opaque ARGB each. */
+    private final Map<Integer, int[]> tints;
+    private final Map<SurfaceKind, MaterialDetailProfile> materialDetail;
+    private final Map<Integer, MaterialDetailProfile> groundMaterialDetail;
+    private final Map<SurfaceKind, Integer> materialBaseColors;
+
+    private PredictionPalette(
+        final Map<Integer, int[]> tints,
+        final Map<SurfaceKind, MaterialDetailProfile> materialDetail,
+        final Map<Integer, MaterialDetailProfile> groundMaterialDetail,
+        final Map<SurfaceKind, Integer> materialBaseColors
+    ) {
+        this.tints = tints;
+        this.materialDetail = materialDetail;
+        this.groundMaterialDetail = groundMaterialDetail;
+        this.materialBaseColors = materialBaseColors;
+    }
+
+    /** Compiled-in {@link BiomeTable} fallbacks only - no live registry sample. */
+    public static PredictionPalette defaults() {
+        return new PredictionPalette(Map.of(), Map.of(), Map.of(), Map.of());
+    }
+
+    /** One immutable snapshot of every biome id the live client registry could resolve this session. */
+    public static PredictionPalette fromSamples(final Map<Integer, int[]> sampledTints) {
+        return fromSamples(sampledTints, Map.of());
+    }
+
+    /** Live biome tint and representative resource-material samples for one immutable session. */
+    public static PredictionPalette fromSamples(
+        final Map<Integer, int[]> sampledTints,
+        final Map<SurfaceKind, MaterialDetailProfile> sampledMaterialDetail
+    ) {
+        return fromSamples(sampledTints, sampledMaterialDetail, Map.of());
+    }
+
+    /** Live biome tint, generic surface detail, and biome-specific ground-material samples. */
+    public static PredictionPalette fromSamples(
+        final Map<Integer, int[]> sampledTints,
+        final Map<SurfaceKind, MaterialDetailProfile> sampledMaterialDetail,
+        final Map<Integer, MaterialDetailProfile> sampledGroundMaterialDetail
+    ) {
+        return fromSamples(
+            sampledTints, sampledMaterialDetail, sampledGroundMaterialDetail, Map.of()
+        );
+    }
+
+    /** Live biome tints plus resource-derived surface base colors and detail profiles. */
+    public static PredictionPalette fromSamples(
+        final Map<Integer, int[]> sampledTints,
+        final Map<SurfaceKind, MaterialDetailProfile> sampledMaterialDetail,
+        final Map<Integer, MaterialDetailProfile> sampledGroundMaterialDetail,
+        final Map<SurfaceKind, Integer> sampledMaterialBaseColors
+    ) {
+        final EnumMap<SurfaceKind, MaterialDetailProfile> materialDetail = new EnumMap<>(SurfaceKind.class);
+        materialDetail.putAll(sampledMaterialDetail);
+        final EnumMap<SurfaceKind, Integer> materialBaseColors = new EnumMap<>(SurfaceKind.class);
+        materialBaseColors.putAll(sampledMaterialBaseColors);
+        return new PredictionPalette(
+            new HashMap<>(sampledTints),
+            materialDetail,
+            new HashMap<>(sampledGroundMaterialDetail),
+            materialBaseColors
+        );
+    }
+
+    /** Uses a live resource material color when one was sampled, otherwise the protocol fallback. */
+    public int materialBaseColor(final SurfaceKind kind, final int fallback) {
+        return materialBaseColors.getOrDefault(kind, fallback);
+    }
+
+    public int grassTint(final int biomeId) {
+        final int[] sampled = tints.get(biomeId);
+        return sampled != null ? sampled[0] : BiomeTable.get(biomeId).grassTint();
+    }
+
+    /** Ground color for a LAND prediction, including biome tint only for grass-like surfaces. */
+    public int groundColor(final int biomeId) {
+        final BiomeTable.Entry entry = BiomeTable.get(biomeId);
+        return entry.grassTinted()
+            ? Argb.multiply(entry.groundBase(), grassTint(biomeId))
+            : entry.groundBase();
+    }
+
+    public int foliageTint(final int biomeId) {
+        final int[] sampled = tints.get(biomeId);
+        return sampled != null ? sampled[1] : BiomeTable.get(biomeId).foliageTint();
+    }
+
+    /** Canopy color for a FOLIAGE prediction, mirroring {@link #groundColor}'s tinted-or-fixed rule. */
+    public int canopyColor(final int biomeId) {
+        final BiomeTable.Entry entry = BiomeTable.get(biomeId);
+        return entry.foliageTinted()
+            ? Argb.multiply(entry.canopyBase(), foliageTint(biomeId))
+            : entry.canopyBase();
+    }
+
+    public int waterTint(final int biomeId) {
+        final int[] sampled = tints.get(biomeId);
+        return sampled != null ? sampled[2] : BiomeTable.get(biomeId).waterTint();
+    }
+
+    /** Applies the representative resource texture for a predicted surface category. */
+    public int applyMaterialDetail(
+        final SurfaceKind kind,
+        final int biomeId,
+        final int argb,
+        final int worldX,
+        final int worldZ
+    ) {
+        final MaterialDetailProfile profile = kind == SurfaceKind.LAND
+            ? groundMaterialDetail.getOrDefault(biomeId, materialDetail.get(kind))
+            : materialDetail.get(kind);
+        return profile == null ? argb : profile.apply(argb, worldX, worldZ, kind.ordinal());
+    }
+}
